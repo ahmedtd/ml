@@ -1,28 +1,24 @@
-package main
+package toolbox
 
 import (
-	"flag"
-	"log"
 	"math/rand"
+	"testing"
 
-	"github.com/ahmedtd/ml/toolbox"
 	"github.com/chewxy/math32"
 )
 
-func main() {
-	flag.Parse()
-
+func TestAgreesWithHandcodedLinreg(t *testing.T) {
 	alpha := float32(0.0001)
 	steps := 1000000
 
 	batchSize := 1000
-	x, y := generateDataset(batchSize)
+	x, y := generate1DLinRegDataset(batchSize)
 
-	net := &toolbox.Network{
-		LossFunction: toolbox.MeanSquaredError,
-		Layers: []*toolbox.Layer{
+	net := &Network{
+		LossFunction: MeanSquaredError,
+		Layers: []*Layer{
 			{
-				Activation: toolbox.Linear,
+				Activation: Linear,
 				W:          make([]float32, 1*1),
 				B:          make([]float32, 1),
 				InputSize:  1,
@@ -32,13 +28,21 @@ func main() {
 	}
 
 	net.GradientDescent(x, y, batchSize, alpha, steps)
-	log.Printf("toolkit m=%v b=%v loss=%v", net.Layers[0].W[0], net.Layers[0].B[0], lossFn(x, y, net.Layers[0].W[0], net.Layers[0].B[0]))
+	t.Logf("toolkit m=%v b=%v loss=%v", net.Layers[0].W[0], net.Layers[0].B[0], lossFn(x, y, net.Layers[0].W[0], net.Layers[0].B[0]))
 
 	m, b := gradientDescentLinReg(x, y, alpha, steps, float32(0.0), float32(0.0))
-	log.Printf("original m=%v b=%v loss=%v", m, b, lossFn(x, y, m, b))
+	t.Logf("original m=%v b=%v loss=%v", m, b, lossFn(x, y, m, b))
+
+	if math32.Abs(net.Layers[0].W[0]-m) > 0.001 {
+		t.Errorf("Disagreement on m parameter; got %v, want %v", net.Layers[0].W[0], m)
+	}
+
+	if math32.Abs(net.Layers[0].B[0]-b) > 0.001 {
+		t.Errorf("Disagreement on b parameter; got %v, want %v", net.Layers[0].B[0], b)
+	}
 }
 
-func generateDataset(m int) (x, y []float32) {
+func generate1DLinRegDataset(m int) (x, y []float32) {
 	r := rand.New(rand.NewSource(12345))
 
 	x = make([]float32, m)
@@ -87,9 +91,6 @@ func gradientDescentLinReg(x, y []float32, learningRate float32, steps int, init
 		gradM, gradB := gradientFn(x, y, m, b)
 		m = m - learningRate*gradM
 		b = b - learningRate*gradB
-		if i%100000 == 0 {
-			log.Printf("original step=%v m=%v b=%v gradM=%v gradB=%v loss=%v", i, m, b, gradM, gradB, lossFn(x, y, m, b))
-		}
 	}
 	return m, b
 }
