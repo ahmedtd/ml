@@ -52,19 +52,19 @@ func generate2DLinRegDataset(m int) (x, y []float32) {
 	x = make([]float32, 2*m)
 	y = make([]float32, m)
 
-	for i := 0; i < m; i++ {
+	for k := 0; k < m; k++ {
 		// Normalization is important --- if I multiply x1 * 1000, the loss is
 		// huge and the model blows up with NaNs.
 		x0 := r.Float32()
 		x1 := r.Float32()
-		y0 := 10*x0 + 3*x1*30
+		y0 := 10*x0 + 3*x1 + 30
 
 		// Perturb the point a little bit
 		y0 += 0.1*math32.Sin(0.001*x0) + (r.Float32()-0.5)*0.1
 
-		x[0*m+i] = x0
-		x[1*m+i] = x1
-		y[i] = y0
+		x[k*2+0] = x0
+		x[k*2+1] = x1
+		y[k] = y0
 	}
 
 	return x, y
@@ -73,7 +73,7 @@ func generate2DLinRegDataset(m int) (x, y []float32) {
 func mseLoss2D(x, y []float32, batchSize int, m0, m1, b float32) float32 {
 	loss := float32(0)
 	for k := 0; k < batchSize; k++ {
-		pred := m0*x[0*batchSize+k] + m1*x[1*batchSize+k] + b
+		pred := m0*x[k*2+0] + m1*x[k*2+1] + b
 		loss += (pred - y[k]) * (pred - y[k]) / (2 * float32(batchSize))
 	}
 	return loss
@@ -84,9 +84,9 @@ func mseLossGradient2D(x, y []float32, batchSize int, m0, m1, b float32) (gradM0
 	gradM0 = float32(0)
 	gradM1 = float32(0)
 	for k := 0; k < batchSize; k++ {
-		pred := m0*x[0*batchSize+k] + m1*x[1*batchSize+k] + b
-		gradM0 += (pred - y[k]) * x[0*batchSize+k] / float32(batchSize)
-		gradM1 += (pred - y[k]) * x[1*batchSize+k] / float32(batchSize)
+		pred := m0*x[k*2+0] + m1*x[k*2+1] + b
+		gradM0 += (pred - y[k]) * x[k*2+0] / float32(batchSize)
+		gradM1 += (pred - y[k]) * x[k*2+1] / float32(batchSize)
 		gradB += (pred - y[k]) / float32(batchSize)
 	}
 	return gradM0, gradM1, gradB
