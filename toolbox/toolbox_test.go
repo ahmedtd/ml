@@ -8,13 +8,13 @@ func BenchmarkApply(b *testing.B) {
 	steps := 1000000
 
 	batchSize := b.N
-	x, _ := generate1DLinRegDataset(batchSize)
+	x, _ := generate2DLinRegDataset(batchSize)
 
 	lay := Layer{
 		Activation: Linear,
-		W:          make([]float32, 1*1),
+		W:          make([]float32, 1*2),
 		B:          make([]float32, 1),
-		InputSize:  1,
+		InputSize:  2,
 		OutputSize: 1,
 	}
 	z := make([]float32, 1*batchSize)
@@ -32,16 +32,16 @@ func BenchmarkLinReg(b *testing.B) {
 	steps := 1000000
 
 	batchSize := b.N
-	x, y := generate1DLinRegDataset(batchSize)
+	x, y := generate2DLinRegDataset(batchSize)
 
 	net := &Network{
 		LossFunction: MeanSquaredError,
 		Layers: []*Layer{
 			{
 				Activation: Linear,
-				W:          make([]float32, 1*1),
+				W:          make([]float32, 1*2),
 				B:          make([]float32, 1),
-				InputSize:  1,
+				InputSize:  2,
 				OutputSize: 1,
 			},
 		},
