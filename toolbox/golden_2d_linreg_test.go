@@ -7,12 +7,21 @@ import (
 	"github.com/chewxy/math32"
 )
 
-func TestAgreesWithGolden2DLinreg(t *testing.T) {
-	alpha := float32(0.0001)
-	steps := 1000000
+func TestAdam2DLinregLearnsKnownModel(t *testing.T) {
+	m0 := float32(10)
+	m1 := float32(5)
+	b := float32(30)
 
-	batchSize := 1000
-	x, y := generate2DLinRegDataset(batchSize)
+	xs := []*AF32{}
+	ys := []*AF32{}
+
+	batchSize := 32
+	for i := 0; i < 10000/batchSize; i++ {
+		x, y := generate2DLinRegDataset(batchSize, m0, m1, b)
+
+		xs = append(xs, x)
+		ys = append(ys, y)
+	}
 
 	net := &Network{
 		LossFunction: MeanSquaredError,
@@ -21,40 +30,48 @@ func TestAgreesWithGolden2DLinreg(t *testing.T) {
 		},
 	}
 
-	net.GradientDescent(x, y, alpha, steps)
-	t.Logf("toolkit m0=%v m1=%v b=%v loss=%v", net.Layers[0].W.At(0, 0), net.Layers[0].W.At(0, 1), net.Layers[0].B.At(0, 0), mseLoss2D(x, y, net.Layers[0].W.At(0, 0), net.Layers[0].W.At(0, 1), net.Layers[0].B.At(0, 0)))
+	aep := net.MakeAdamParameters(0.001, batchSize, 4, 1)
 
-	m0, m1, b := gradientDescent2DLinReg(x, y, alpha, steps)
-	t.Logf("original m0=%v m1=%v b=%v loss=%v", m0, m1, b, mseLoss2D(x, y, m0, m1, b))
+	r := rand.New(rand.NewSource(12345))
+	for epoch := 0; epoch < 124; epoch++ {
+		for batch := 0; batch < len(xs); batch++ {
+			net.AdamStep(xs[batch], ys[batch], aep)
+		}
 
-	if math32.Abs(net.Layers[0].W.At(0, 0)-m0) > 0.001 {
+		// Shuffle batches so we present them in a different order in the next epoch.
+		r.Shuffle(len(xs), func(i, j int) {
+			xs[i], xs[j] = xs[j], xs[i]
+			ys[i], ys[j] = ys[j], ys[i]
+		})
+	}
+
+	t.Logf("toolkit m0=%v m1=%v b=%v loss=%v", net.Layers[0].W.At(0, 0), net.Layers[0].W.At(0, 1), net.Layers[0].B.At(0, 0), net.Loss(xs, ys))
+
+	if math32.Abs(net.Layers[0].W.At(0, 0)-m0) > 0.01 {
 		t.Errorf("Disagreement on m0 parameter; got %v, want %v", net.Layers[0].W.At(0, 0), m0)
 	}
 
-	if math32.Abs(net.Layers[0].W.At(0, 1)-m1) > 0.001 {
+	if math32.Abs(net.Layers[0].W.At(0, 1)-m1) > 0.01 {
 		t.Errorf("Disagreement on m1 parameter; got %v, want %v", net.Layers[0].W.At(0, 1), m1)
 	}
 
-	if math32.Abs(net.Layers[0].B.At(0, 0)-b) > 0.001 {
+	if math32.Abs(net.Layers[0].B.At(0, 0)-b) > 0.01 {
 		t.Errorf("Disagreement on b parameter; got %v, want %v", net.Layers[0].B.At(0, 0), b)
 	}
 }
 
-func generate2DLinRegDataset(m int) (x, y *AF32) {
+func generate2DLinRegDataset(batchSize int, m0, m1, b float32) (x, y *AF32) {
 	r := rand.New(rand.NewSource(12345))
 
-	x = MakeAF32(m, 2)
-	y = MakeAF32(m, 1)
+	x = MakeAF32(batchSize, 2)
+	y = MakeAF32(batchSize, 1)
 
-	for k := 0; k < m; k++ {
+	for k := 0; k < batchSize; k++ {
 		// Normalization is important --- if I multiply x1 * 1000, the loss is
 		// huge and the model blows up with NaNs.
 		x0 := r.Float32()
 		x1 := r.Float32()
-		y0 := 10*x0 + 3*x1 + 30
-
-		// Perturb the point a little bit
-		y0 += 0.1*math32.Sin(0.001*x0) + (r.Float32()-0.5)*0.1
+		y0 := m0*x0 + m1*x1 + b
 
 		x.Set(k, 0, x0)
 		x.Set(k, 1, x1)
@@ -62,37 +79,4 @@ func generate2DLinRegDataset(m int) (x, y *AF32) {
 	}
 
 	return x, y
-}
-
-func mseLoss2D(x, y *AF32, m0, m1, b float32) float32 {
-	loss := float32(0)
-	for k := 0; k < x.Shape0; k++ {
-		pred := m0*x.At(k, 0) + m1*x.At(k, 1) + b
-		loss += (pred - y.At(k, 0)) * (pred - y.At(k, 0)) / (2 * float32(x.Shape0))
-	}
-	return loss
-}
-
-func mseLossGradient2D(x, y *AF32, m0, m1, b float32) (gradM0, gradM1, gradB float32) {
-	batchSize := x.Shape0
-	gradB = float32(0)
-	gradM0 = float32(0)
-	gradM1 = float32(0)
-	for k := 0; k < batchSize; k++ {
-		pred := m0*x.At(k, 0) + m1*x.At(k, 1) + b
-		gradM0 += (pred - y.At(k, 0)) * x.At(k, 0) / float32(batchSize)
-		gradM1 += (pred - y.At(k, 0)) * x.At(k, 1) / float32(batchSize)
-		gradB += (pred - y.At(k, 0)) / float32(batchSize)
-	}
-	return gradM0, gradM1, gradB
-}
-
-func gradientDescent2DLinReg(x, y *AF32, learningRate float32, steps int) (m0, m1, b float32) {
-	for i := 0; i < steps; i++ {
-		gradM0, gradM1, gradB := mseLossGradient2D(x, y, m0, m1, b)
-		m0 -= learningRate * gradM0
-		m1 -= learningRate * gradM1
-		b -= learningRate * gradB
-	}
-	return m0, m1, b
 }
