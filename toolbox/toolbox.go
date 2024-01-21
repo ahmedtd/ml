@@ -2,10 +2,15 @@ package toolbox
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand"
+	"slices"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/chewxy/math32"
 	"golang.org/x/sync/semaphore"
@@ -36,12 +41,120 @@ func MakeAF32(shape0, shape1 int) *AF32 {
 	}
 }
 
+func MakeScalarAF32(scalar float32) *AF32 {
+	return &AF32{
+		V:      []float32{scalar},
+		Shape0: 1,
+		Shape1: 1,
+	}
+}
+
 func (a *AF32) At(idx0, idx1 int) float32 {
 	return a.V[idx0*a.Shape1+idx1]
 }
 
 func (a *AF32) Set(idx0, idx1 int, v float32) {
 	a.V[idx0*a.Shape1+idx1] = v
+}
+
+func WriteSafeTensors(w io.Writer, tensors map[string]*AF32) error {
+	header := map[string]SafeTensorInfo{}
+	dataOffset := 0
+
+	keys := []string{}
+	for k := range tensors {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+
+	for _, k := range keys {
+		begin := dataOffset
+		dataOffset += len(tensors[k].V) * 4
+		end := dataOffset
+
+		header[k] = SafeTensorInfo{
+			DType:       "F32",
+			Shape:       []int{tensors[k].Shape0, tensors[k].Shape1},
+			DataOffsets: []int{begin, end},
+		}
+	}
+
+	headerBytes, err := json.Marshal(header)
+	if err != nil {
+		return fmt.Errorf("while marshaling header: %w", err)
+	}
+
+	if err := binary.Write(w, binary.LittleEndian, uint64(len(headerBytes))); err != nil {
+		return fmt.Errorf("while writing header length: %w", err)
+	}
+
+	if _, err := w.Write(headerBytes); err != nil {
+		return fmt.Errorf("while writing header: %w", err)
+	}
+
+	for _, k := range keys {
+		if err := binary.Write(w, binary.LittleEndian, tensors[k].V); err != nil {
+			return fmt.Errorf("while writing %s values: %w", k, err)
+		}
+	}
+
+	return nil
+}
+
+func ReadSafeTensors(r io.Reader) (map[string]*AF32, error) {
+	rat := r.(io.ReaderAt)
+
+	var headerLen uint64
+	if err := binary.Read(r, binary.LittleEndian, &headerLen); err != nil {
+		return nil, fmt.Errorf("while reading header length: %w", err)
+	}
+
+	headerBytes := make([]byte, int(headerLen))
+	if _, err := r.Read(headerBytes); err != nil {
+		return nil, fmt.Errorf("while reading header: %w", err)
+	}
+
+	header := map[string]SafeTensorInfo{}
+	if err := json.Unmarshal(headerBytes, &header); err != nil {
+		return nil, fmt.Errorf("while reading header: %w", err)
+	}
+
+	tensors := map[string]*AF32{}
+	for k, hdr := range header {
+		if hdr.DType != "F32" {
+			return nil, fmt.Errorf("unsupported dtype %s", hdr.DType)
+		}
+		if len(hdr.Shape) != 2 {
+			return nil, fmt.Errorf("unsupported shape %v", hdr.Shape)
+		}
+		for _, s := range hdr.Shape {
+			if s < 1 {
+				return nil, fmt.Errorf("bad shape %v", hdr.Shape)
+			}
+		}
+
+		size := hdr.Shape[0] * hdr.Shape[1]
+		sizeBytes := size * 4
+		valBytes := make([]byte, sizeBytes)
+		if _, err := rat.ReadAt(valBytes, 8+int64(headerLen)+int64(hdr.DataOffsets[0])); err != nil {
+			return nil, fmt.Errorf("while reading bytes for %s: %w", k, err)
+		}
+
+		tensor := &AF32{
+			V:      castToF32(valBytes),
+			Shape0: hdr.Shape[0],
+			Shape1: hdr.Shape[1],
+		}
+
+		tensors[k] = tensor
+	}
+
+	return tensors, nil
+}
+
+func castToF32(b []byte) []float32 {
+	f := unsafe.Slice((*float32)(unsafe.Pointer(&b[0])), len(b)/4)
+	return f
 }
 
 type ActivationType int
@@ -66,7 +179,7 @@ func MeanSquaredErrorLoss(y, a *AF32, denom int) float32 {
 	if y.Shape0 != a.Shape0 {
 		panic("dimension mismatch")
 	}
-	if y.Shape1 != y.Shape1 {
+	if y.Shape1 != a.Shape1 {
 		panic("dimension mismatch")
 	}
 
@@ -149,6 +262,17 @@ func SparseCategoricalCrossEntropyLoss(y, a *AF32, denom int) float32 {
 		for t := 0; t < outputSize; t++ {
 			if y.At(s, 0) == float32(t) {
 				softmax := math32.Exp(a.At(s, t)-maxa) / suma
+
+				// Clamp softmax to make sure the loss is finite.
+				//
+				// https://stackoverflow.com/a/70608107
+				if softmax < 1e-7 {
+					softmax = 1e-7
+				}
+				if softmax > 1-1e-7 {
+					softmax = 1 - 1e-7
+				}
+
 				loss += -math32.Log(softmax) / float32(denom)
 			}
 		}
@@ -181,8 +305,10 @@ func SparseCategoricalCrossEntropyLossGradient(y, a, dJda *AF32, sliceMin, slice
 	}
 	_ = dJda.At(batchSize-1, outputSize-1)
 
+	// ref https://eli.thegreenplace.net/2016/the-softmax-function-and-its-derivative/
+
 	for k := sliceMin; k < sliceMax; k++ {
-		// We are taking softmax(a[l,k]) for all l.
+		// We are taking softmax(a[k, l]) for all l.
 		//
 		// For stability, use the identity softmax(v) = softmax(v - c), and
 		// subtract the maximimum element of a from every element as we evaluate
@@ -204,6 +330,17 @@ func SparseCategoricalCrossEntropyLossGradient(y, a, dJda *AF32, sliceMin, slice
 
 		for i := 0; i < outputSize; i++ {
 			softmax := math32.Exp(a.At(k, i)-maxa) / sum
+
+			// Clamp softmax to make sure the loss is finite.
+			//
+			// https://stackoverflow.com/a/70608107
+			if softmax < 1e-7 {
+				softmax = 1e-7
+			}
+			if softmax > 1-1e-7 {
+				softmax = 1 - 1e-7
+			}
+
 			if y.At(k, 0) == float32(i) {
 				dJda.Set(k, i, (softmax-1)/float32(batchSize))
 			} else {
@@ -216,6 +353,49 @@ func SparseCategoricalCrossEntropyLossGradient(y, a, dJda *AF32, sliceMin, slice
 type Network struct {
 	LossFunction LossFunctionType
 	Layers       []*Layer
+}
+
+type SafeTensorInfo struct {
+	DType       string `json:"dtype"`
+	Shape       []int  `json:"shape"`
+	DataOffsets []int  `json:"data_offsets"`
+}
+
+func (net *Network) LoadTensors(tensors map[string]*AF32) error {
+	for l := 0; l < len(net.Layers); l++ {
+		weightKey := fmt.Sprintf("net.%d.weights", l)
+		weightTensor, ok := tensors[weightKey]
+		if !ok {
+			return fmt.Errorf("no entry for %s", weightKey)
+		}
+		gotWeightShape := []int{weightTensor.Shape0, weightTensor.Shape1}
+		wantWeightShape := []int{net.Layers[l].OutputSize, net.Layers[l].InputSize}
+		if !slices.Equal(gotWeightShape, wantWeightShape) {
+			return fmt.Errorf("wrong shape; got %v want %v", gotWeightShape, wantWeightShape)
+		}
+		net.Layers[l].W = weightTensor
+
+		biasKey := fmt.Sprintf("net.%d.biases", l)
+		biasTensor, ok := tensors[biasKey]
+		if !ok {
+			return fmt.Errorf("no entry for %s", biasKey)
+		}
+		gotBiasShape := []int{biasTensor.Shape0, biasTensor.Shape1}
+		wantBiasShape := []int{net.Layers[l].OutputSize, 1}
+		if !slices.Equal(gotBiasShape, wantBiasShape) {
+			return fmt.Errorf("wrong shape; got %v want %v", gotBiasShape, wantBiasShape)
+		}
+		net.Layers[l].B = biasTensor
+	}
+
+	return nil
+}
+
+func (net *Network) DumpTensors(tensors map[string]*AF32) {
+	for l := 0; l < len(net.Layers); l++ {
+		tensors[fmt.Sprintf("net.%d.weights", l)] = net.Layers[l].W
+		tensors[fmt.Sprintf("net.%d.biases", l)] = net.Layers[l].B
+	}
 }
 
 // x is the input.  Shape (batchSize, layers[0].InputSize)
@@ -301,19 +481,10 @@ func (net *Network) Loss(xs, ys []*AF32) float32 {
 	return loss
 }
 
-type Batch struct {
-	X *AF32
-	Y *AF32
-}
-
 // x is the input.  Shape (batchSize, layers[0].InputSize)
 // y is the ground truth output.  Shape (batchSize, ?(dependent on loss function))
 func (net *Network) GradientDescent(x, y *AF32, alpha float32, steps int) {
 	batchSize := x.Shape0
-
-	// Create per-layer evaluation variables.
-	//
-	// TODO: We can be smarter about most of these, like we are in Apply().
 
 	// TODO: Very interesting.  Even with only one thread (no goroutine
 	// launches, splitting the work up into batches dramatically improves
@@ -483,11 +654,129 @@ type AdamEvaluationParameters struct {
 	newVW []*AF32
 	newVB []*AF32
 
-	overall            time.Duration
-	gradientCompute    time.Duration
-	gradientReassembly time.Duration
-	momentVectors      time.Duration
-	weightUpdate       time.Duration
+	Overall            time.Duration
+	GradientCompute    time.Duration
+	GradientReassembly time.Duration
+	MomentVectors      time.Duration
+	WeightUpdate       time.Duration
+}
+
+func (aep *AdamEvaluationParameters) ResetTimings() {
+	aep.Overall = 0 * time.Second
+	aep.GradientCompute = 0 * time.Second
+	aep.GradientReassembly = 0 * time.Second
+	aep.MomentVectors = 0 * time.Second
+	aep.WeightUpdate = 0 * time.Second
+}
+
+func (aep *AdamEvaluationParameters) DumpTensors(tensors map[string]*AF32) {
+	// This is garbage -- save scalars as 1x1 tensors
+	tensors["adam.step"] = MakeScalarAF32(float32(aep.step))
+	tensors["adam.alpha"] = MakeScalarAF32(aep.alpha)
+	tensors["adam.beta1"] = MakeScalarAF32(aep.beta1)
+	tensors["adam.beta2"] = MakeScalarAF32(aep.beta2)
+	tensors["adam.epsilon"] = MakeScalarAF32(aep.epsilon)
+	tensors["adam.beta1T"] = MakeScalarAF32(aep.beta1T)
+	tensors["adam.beta2T"] = MakeScalarAF32(aep.beta2T)
+	tensors["adam.batchSize"] = MakeScalarAF32(float32(aep.batchSize))
+	tensors["adam.numWorkUnits"] = MakeScalarAF32(float32(aep.numWorkUnits))
+	tensors["adam.numThreads"] = MakeScalarAF32(float32(aep.numThreads))
+
+	// We don't save dadz, a, djda, djdw, djdb because they are scratch
+	// variables overwritten at each step.
+
+	// We don't save newMW, newVW, newMB, newVB because they are scratch
+	// variables overwritten at each step.
+
+	for l := 0; l < len(aep.oldMW); l++ {
+		tensors[fmt.Sprintf("adam.%d.oldMW", l)] = aep.oldMW[l]
+		tensors[fmt.Sprintf("adam.%d.oldVW", l)] = aep.oldVW[l]
+		tensors[fmt.Sprintf("adam.%d.oldMB", l)] = aep.oldMB[l]
+		tensors[fmt.Sprintf("adam.%d.oldVB", l)] = aep.oldVB[l]
+	}
+}
+
+func loadIntFromTensor(tensors map[string]*AF32, key string) (int, error) {
+	tensor, ok := tensors[key]
+	if !ok {
+		return 0, fmt.Errorf("missing tensor %s", key)
+	}
+	return int(tensor.At(0, 0)), nil
+}
+
+func loadFloat32FromTensor(tensors map[string]*AF32, key string) (float32, error) {
+	tensor, ok := tensors[key]
+	if !ok {
+		return 0, fmt.Errorf("missing tensor %s", key)
+	}
+
+	return tensor.At(0, 0), nil
+}
+
+func (aep *AdamEvaluationParameters) LoadTensors(tensors map[string]*AF32) error {
+	var err error
+	aep.step, err = loadIntFromTensor(tensors, "adam.step")
+	if err != nil {
+		return err
+	}
+	aep.alpha, err = loadFloat32FromTensor(tensors, "adam.alpha")
+	if err != nil {
+		return err
+	}
+	aep.beta1, err = loadFloat32FromTensor(tensors, "adam.beta1")
+	if err != nil {
+		return err
+	}
+	aep.beta2, err = loadFloat32FromTensor(tensors, "adam.beta2")
+	if err != nil {
+		return err
+	}
+	aep.epsilon, err = loadFloat32FromTensor(tensors, "adam.epsilon")
+	if err != nil {
+		return err
+	}
+	aep.beta1T, err = loadFloat32FromTensor(tensors, "adam.beta1T")
+	if err != nil {
+		return err
+	}
+	aep.beta2T, err = loadFloat32FromTensor(tensors, "adam.beta2T")
+	if err != nil {
+		return err
+	}
+	aep.batchSize, err = loadIntFromTensor(tensors, "adam.batchSize")
+	if err != nil {
+		return err
+	}
+	aep.numWorkUnits, err = loadIntFromTensor(tensors, "adam.numWorkUnits")
+	if err != nil {
+		return err
+	}
+	aep.numThreads, err = loadIntFromTensor(tensors, "adam.numThreads")
+	if err != nil {
+		return err
+	}
+
+	for l := 0; l < len(aep.oldMW); l++ {
+		var ok bool
+		aep.oldMW[l], ok = tensors[fmt.Sprintf("adam.%d.oldMW", l)]
+		if !ok {
+			return fmt.Errorf("missing tensor adam.%d.oldMW", l)
+		}
+		aep.oldVW[l], ok = tensors[fmt.Sprintf("adam.%d.oldVW", l)]
+		if !ok {
+			return fmt.Errorf("missing tensor adam.%d.oldVW", l)
+		}
+		aep.oldMB[l], ok = tensors[fmt.Sprintf("adam.%d.oldMB", l)]
+		if !ok {
+			return fmt.Errorf("missing tensor adam.%d.oldMB", l)
+		}
+		aep.oldVB[l], ok = tensors[fmt.Sprintf("adam.%d.oldVB", l)]
+		if !ok {
+			return fmt.Errorf("missing tensor adam.%d.oldVB", l)
+		}
+	}
+
+	return nil
 }
 
 func (net *Network) MakeAdamParameters(alpha float32, batchSize, numWorkUnits, numThreads int) *AdamEvaluationParameters {
@@ -690,11 +979,11 @@ func (net *Network) AdamStep(x, y *AF32, aep *AdamEvaluationParameters) {
 	weightUpdateFinished := time.Now()
 
 	overallTime := weightUpdateFinished.Sub(start)
-	aep.overall += overallTime
-	aep.gradientCompute += gradientComputeFinished.Sub(start)
-	aep.gradientReassembly += gradientReassemblyFinished.Sub(gradientComputeFinished)
-	aep.momentVectors += momentVectorsFinished.Sub(gradientReassemblyFinished)
-	aep.weightUpdate += weightUpdateFinished.Sub(momentVectorsFinished)
+	aep.Overall += overallTime
+	aep.GradientCompute += gradientComputeFinished.Sub(start)
+	aep.GradientReassembly += gradientReassemblyFinished.Sub(gradientComputeFinished)
+	aep.MomentVectors += momentVectorsFinished.Sub(gradientReassemblyFinished)
+	aep.WeightUpdate += weightUpdateFinished.Sub(momentVectorsFinished)
 	// gradientComputePct := gradientComputeFinished.Sub(start).Seconds() / overallTime.Seconds() * 100.0
 	// gradientReassemblyPct := gradientReassemblyFinished.Sub(gradientComputeFinished).Seconds() / overallTime.Seconds() * 100.0
 	// momentVectorsPct := momentVectorsFinished.Sub(gradientReassemblyFinished).Seconds() / overallTime.Seconds() * 100.0

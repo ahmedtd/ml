@@ -1,3 +1,8 @@
+// Command mnist implements training an inference on the MNIST dataset.
+//
+// To train: `go run ./cmd/mnist train --data-file=cmd/mnist/data/mnist.npz`
+//
+// To infer: `go run ./cmd/mnist infer --weights=mnist-out.safetensors --image=cmd/mnist/data/five.png`
 package main
 
 import (
@@ -20,6 +25,7 @@ func main() {
 	subcommands.Register(subcommands.CommandsCommand(), "")
 
 	subcommands.Register(&TrainCommand{}, "")
+	subcommands.Register(&InferCommand{}, "")
 
 	flag.Parse()
 	ctx := context.Background()
@@ -28,6 +34,9 @@ func main() {
 
 type TrainCommand struct {
 	dataFile string
+
+	fromCheckpointFile string
+	outputWeightFile   string
 }
 
 var _ subcommands.Command = (*TrainCommand)(nil)
@@ -46,6 +55,8 @@ func (*TrainCommand) Usage() string {
 
 func (c *TrainCommand) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.dataFile, "data-file", "mnist.npz", "Path to the mnist.npz input file")
+	f.StringVar(&c.fromCheckpointFile, "from-checkpoint", "", "Path to initial weights to load for training")
+	f.StringVar(&c.outputWeightFile, "output-weight-file", "mnist-out.safetensors", "Path to save trained weights (safetensors format)")
 }
 
 func (c *TrainCommand) Execute(ctx context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
@@ -89,13 +100,19 @@ func (c *TrainCommand) executeErr(ctx context.Context) error {
 	net := &toolbox.Network{
 		LossFunction: toolbox.SparseCategoricalCrossEntropyFromLogits,
 		Layers: []*toolbox.Layer{
-			toolbox.MakeDense(toolbox.ReLU, 28*28, 25),
-			toolbox.MakeDense(toolbox.ReLU, 25, 15),
-			toolbox.MakeDense(toolbox.Linear, 15, 10),
+			toolbox.MakeDense(toolbox.ReLU, 28*28, 256),
+			toolbox.MakeDense(toolbox.ReLU, 256, 256),
+			toolbox.MakeDense(toolbox.Linear, 256, 10),
 		},
 	}
 
-	aep := net.MakeAdamParameters(0.001, batchSize, 4, 4)
+	aep := net.MakeAdamParameters(0.001, batchSize, batchSize, 4)
+
+	if c.fromCheckpointFile != "" {
+		if err := c.loadCheckpoint(net, aep); err != nil {
+			return fmt.Errorf("while loading initial checkpoint: %w", err)
+		}
+	}
 
 	r := rand.New(rand.NewSource(12345))
 	for epoch := 0; epoch < 100; epoch++ {
@@ -108,6 +125,10 @@ func (c *TrainCommand) executeErr(ctx context.Context) error {
 			xs[i], xs[j] = xs[j], xs[i]
 			ys[i], ys[j] = ys[j], ys[i]
 		})
+
+		if err := c.writeCheckpoint(net, aep); err != nil {
+			return fmt.Errorf("while writing checkpoint: %w", err)
+		}
 
 		// Check performance on the train data set
 		trainPred := net.Apply(xTrain)
@@ -148,6 +169,49 @@ func (c *TrainCommand) executeErr(ctx context.Context) error {
 		testPercent := float32(numCorrectTest) / float32(yTest.Shape0) * float32(100)
 
 		log.Printf("epoch %d training-loss=%f training-pct=%.1f testing-loss=%f testing-pct=%.1f", epoch, net.Loss(xs, ys), trainPercent, net.Loss([]*toolbox.AF32{xTest}, []*toolbox.AF32{yTest}), testPercent)
+		log.Printf("epoch %d timings overall=%v gradientcompute=%.1f gradientreassembly=%.1f momentvectors=%.1f weightupdate=%.1f", epoch, aep.Overall, aep.GradientCompute.Seconds()/aep.Overall.Seconds(), aep.GradientReassembly.Seconds()/aep.Overall.Seconds(), aep.MomentVectors.Seconds()/aep.Overall.Seconds(), aep.WeightUpdate.Seconds()/aep.Overall.Seconds())
+		aep.ResetTimings()
+	}
+
+	return nil
+}
+
+func (c *TrainCommand) loadCheckpoint(net *toolbox.Network, aep *toolbox.AdamEvaluationParameters) error {
+	f, err := os.Open(c.fromCheckpointFile)
+	if err != nil {
+		return fmt.Errorf("while opening checkpoint file: %w", err)
+	}
+	defer f.Close()
+
+	tensors, err := toolbox.ReadSafeTensors(f)
+	if err != nil {
+		return fmt.Errorf("while reading checkpoint tensors: %w", err)
+	}
+
+	if err := net.LoadTensors(tensors); err != nil {
+		return fmt.Errorf("while restoring network: %w", err)
+	}
+	if err := aep.LoadTensors(tensors); err != nil {
+		return fmt.Errorf("while restoring Adam: %w", err)
+	}
+
+	return nil
+}
+
+func (c *TrainCommand) writeCheckpoint(net *toolbox.Network, aep *toolbox.AdamEvaluationParameters) error {
+	f, err := os.Create(c.outputWeightFile)
+	if err != nil {
+		return fmt.Errorf("while creating checkpoint file: %w", err)
+	}
+	defer f.Close()
+
+	tensors := map[string]*toolbox.AF32{}
+
+	net.DumpTensors(tensors)
+	aep.DumpTensors(tensors)
+
+	if err := toolbox.WriteSafeTensors(f, tensors); err != nil {
+		return fmt.Errorf("while writing checkpoint tensors: %w", err)
 	}
 
 	return nil
@@ -200,7 +264,7 @@ func loadImages(r *npz.Reader, name string) (*toolbox.AF32, error) {
 
 	result := toolbox.MakeAF32(header.Descr.Shape[0], header.Descr.Shape[1]*header.Descr.Shape[2])
 	for i := 0; i < len(raw); i++ {
-		result.V[i] = float32(raw[i])
+		result.V[i] = float32(raw[i]) / float32(255)
 	}
 
 	return result, nil
