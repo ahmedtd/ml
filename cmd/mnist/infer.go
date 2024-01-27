@@ -7,6 +7,7 @@ import (
 	"image"
 	"image/color"
 	"log"
+	"math/rand"
 	"os"
 
 	"github.com/ahmedtd/ml/toolbox"
@@ -50,12 +51,14 @@ func (c *InferCommand) Execute(ctx context.Context, f *flag.FlagSet, _ ...interf
 }
 
 func (c *InferCommand) executeErr(ctx context.Context) error {
+	r := rand.New(rand.NewSource(12345))
+
 	net := &toolbox.Network{
 		LossFunction: toolbox.SparseCategoricalCrossEntropyFromLogits,
 		Layers: []*toolbox.Layer{
-			toolbox.MakeDense(toolbox.ReLU, 28*28, 256),
-			toolbox.MakeDense(toolbox.ReLU, 256, 256),
-			toolbox.MakeDense(toolbox.Linear, 256, 10),
+			toolbox.MakeDense(toolbox.ReLU, 28*28, 256, r),
+			toolbox.MakeDense(toolbox.ReLU, 256, 256, r),
+			toolbox.MakeDense(toolbox.Linear, 256, 10, r),
 		},
 	}
 

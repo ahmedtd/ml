@@ -12,6 +12,7 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"runtime/pprof"
 
 	"github.com/ahmedtd/ml/toolbox"
 	"github.com/chewxy/math32"
@@ -37,6 +38,8 @@ type TrainCommand struct {
 
 	fromCheckpointFile string
 	outputWeightFile   string
+
+	cpuProfileFile string
 }
 
 var _ subcommands.Command = (*TrainCommand)(nil)
@@ -57,6 +60,8 @@ func (c *TrainCommand) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.dataFile, "data-file", "mnist.npz", "Path to the mnist.npz input file")
 	f.StringVar(&c.fromCheckpointFile, "from-checkpoint", "", "Path to initial weights to load for training")
 	f.StringVar(&c.outputWeightFile, "output-weight-file", "mnist-out.safetensors", "Path to save trained weights (safetensors format)")
+
+	f.StringVar(&c.cpuProfileFile, "cpu-profile", "", "Write a CPU profile")
 }
 
 func (c *TrainCommand) Execute(ctx context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
@@ -68,14 +73,26 @@ func (c *TrainCommand) Execute(ctx context.Context, f *flag.FlagSet, _ ...interf
 }
 
 func (c *TrainCommand) executeErr(ctx context.Context) error {
+	if c.cpuProfileFile != "" {
+		f, err := os.Create(c.cpuProfileFile)
+		if err != nil {
+			return fmt.Errorf("while creating CPU profile file: %w", err)
+		}
+		defer f.Close()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			return fmt.Errorf("while starting CPU profile: %w", err)
+		}
+		defer pprof.StopCPUProfile()
+	}
+
 	xTrain, yTrain, xTest, yTest, err := loadMNIST(c.dataFile)
 	if err != nil {
 		return fmt.Errorf("while loading MNIST data set: %w", err)
 	}
 
-	// Group training data into batches of 32, discarding the last
+	// Group training data into batches, discarding the last
 	// partially-full batch.
-	batchSize := 32
+	batchSize := 128
 	xs := []*toolbox.AF32{}
 	ys := []*toolbox.AF32{}
 	for batch := 0; batch < xTrain.Shape0/batchSize; batch++ {
@@ -95,18 +112,21 @@ func (c *TrainCommand) executeErr(ctx context.Context) error {
 		ys = append(ys, y)
 	}
 
-	log.Printf("Data loaded and batched")
+	log.Printf("Data loaded and batched into %d batches", len(xs))
+
+	r := rand.New(rand.NewSource(12345))
 
 	net := &toolbox.Network{
 		LossFunction: toolbox.SparseCategoricalCrossEntropyFromLogits,
 		Layers: []*toolbox.Layer{
-			toolbox.MakeDense(toolbox.ReLU, 28*28, 256),
-			toolbox.MakeDense(toolbox.ReLU, 256, 256),
-			toolbox.MakeDense(toolbox.Linear, 256, 10),
+			toolbox.MakeDense(toolbox.ReLU, 28*28, 256, r),
+			toolbox.MakeDense(toolbox.ReLU, 256, 256, r),
+			toolbox.MakeDense(toolbox.Linear, 256, 10, r),
 		},
 	}
 
-	aep := net.MakeAdamParameters(0.001, batchSize, batchSize, 4)
+	// TODO: Use 4 threads instead of 1 thread
+	aep := net.MakeAdamParameters(0.001, batchSize)
 
 	if c.fromCheckpointFile != "" {
 		if err := c.loadCheckpoint(net, aep); err != nil {
@@ -114,10 +134,9 @@ func (c *TrainCommand) executeErr(ctx context.Context) error {
 		}
 	}
 
-	r := rand.New(rand.NewSource(12345))
-	for epoch := 0; epoch < 100; epoch++ {
+	for epoch := 0; epoch < 2; epoch++ {
 		for batch := 0; batch < len(xs); batch++ {
-			net.AdamStep(xs[batch], ys[batch], aep)
+			net.AdamStep(xs[batch], ys[batch], aep, 1)
 		}
 
 		// Shuffle batches so we present them in a different order in the next epoch.
@@ -169,8 +188,16 @@ func (c *TrainCommand) executeErr(ctx context.Context) error {
 		testPercent := float32(numCorrectTest) / float32(yTest.Shape0) * float32(100)
 
 		log.Printf("epoch %d training-loss=%f training-pct=%.1f testing-loss=%f testing-pct=%.1f", epoch, net.Loss(xs, ys), trainPercent, net.Loss([]*toolbox.AF32{xTest}, []*toolbox.AF32{yTest}), testPercent)
-		log.Printf("epoch %d timings overall=%v gradientcompute=%.1f gradientreassembly=%.1f momentvectors=%.1f weightupdate=%.1f", epoch, aep.Overall, aep.GradientCompute.Seconds()/aep.Overall.Seconds(), aep.GradientReassembly.Seconds()/aep.Overall.Seconds(), aep.MomentVectors.Seconds()/aep.Overall.Seconds(), aep.WeightUpdate.Seconds()/aep.Overall.Seconds())
-		aep.ResetTimings()
+		log.Printf("epoch %d timings overall=%.1f forward=%.1f loss=%.1f backprop=%.1f momentvectors=%.1f weightupdate=%.1f",
+			epoch,
+			aep.Timings.Overall.Seconds(),
+			aep.Timings.Forward.Seconds(),
+			aep.Timings.Loss.Seconds(),
+			aep.Timings.Backpropagation.Seconds(),
+			aep.Timings.MomentVectors.Seconds(),
+			aep.Timings.WeightUpdate.Seconds(),
+		)
+		aep.Timings.Reset()
 	}
 
 	return nil

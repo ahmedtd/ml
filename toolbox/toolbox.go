@@ -1,19 +1,16 @@
 package toolbox
 
 import (
-	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math/rand"
 	"slices"
-	"sync"
 	"time"
 	"unsafe"
 
 	"github.com/chewxy/math32"
-	"golang.org/x/sync/semaphore"
 )
 
 // Verify bounds check elimination with
@@ -49,12 +46,52 @@ func MakeScalarAF32(scalar float32) *AF32 {
 	}
 }
 
+func MakeAF32Transpose(in *AF32) *AF32 {
+	return &AF32{
+		V:      make([]float32, in.Shape0*in.Shape1),
+		Shape0: in.Shape1,
+		Shape1: in.Shape0,
+	}
+}
+
+func AF32Transpose(in *AF32, out *AF32) {
+	for i := 0; i < in.Shape0; i++ {
+		for j := 0; j < in.Shape1; j++ {
+			out.Set(j, i, in.At(i, j))
+		}
+	}
+}
+
+func (a *AF32) At1(idx int) float32 {
+	pBase := unsafe.Pointer(unsafe.SliceData(a.V))
+	pElt := (*float32)(unsafe.Pointer(uintptr(pBase) + uintptr(idx*4)))
+	return *pElt
+	// return a.V[idx]
+}
+
 func (a *AF32) At(idx0, idx1 int) float32 {
+	pBase := unsafe.Pointer(unsafe.SliceData(a.V))
+	pElt := (*float32)(unsafe.Pointer(uintptr(pBase) + uintptr(idx0*a.Shape1*4+idx1*4)))
+	return *pElt
+	// return a.V[idx0*a.Shape1+idx1]
+}
+
+func (a *AF32) CheckedAt(idx0, idx1 int) float32 {
 	return a.V[idx0*a.Shape1+idx1]
 }
 
+func (a *AF32) Set1(idx int, v float32) {
+	pBase := unsafe.Pointer(unsafe.SliceData(a.V))
+	pElt := (*float32)(unsafe.Pointer(uintptr(pBase) + uintptr(idx*4)))
+	*pElt = v
+	// a.V[idx] = v
+}
+
 func (a *AF32) Set(idx0, idx1 int, v float32) {
-	a.V[idx0*a.Shape1+idx1] = v
+	pBase := unsafe.Pointer(unsafe.SliceData(a.V))
+	pElt := (*float32)(unsafe.Pointer(uintptr(pBase) + uintptr(idx0*a.Shape1*4+idx1*4)))
+	*pElt = v
+	// a.V[idx0*a.Shape1+idx1] = v
 }
 
 func WriteSafeTensors(w io.Writer, tensors map[string]*AF32) error {
@@ -201,7 +238,7 @@ func MeanSquaredErrorLoss(y, a *AF32, denom int) float32 {
 // y is the ground truth output.  Shape (batchSize, lay.OutputSize)
 // a is the layer's forward output.  Shape (batchSize, lay.OutputSize)
 // dJda (output) is storage for the gradient of the loss wrt a.  Shape (batchSize, lay.OutputSize)
-func MeanSquaredErrorLossGradient(y, a, dJda *AF32, sliceMin, sliceMax int) {
+func MeanSquaredErrorLossGradient(y, a, dJda *AF32) {
 	batchSize := a.Shape0
 	outputSize := a.Shape1
 	_ = a.At(batchSize-1, outputSize-1)
@@ -222,7 +259,7 @@ func MeanSquaredErrorLossGradient(y, a, dJda *AF32, sliceMin, sliceMax int) {
 	}
 	_ = dJda.At(batchSize-1, outputSize-1)
 
-	for k := sliceMin; k < sliceMax; k++ {
+	for k := 0; k < batchSize; k++ {
 		for i := 0; i < outputSize; i++ {
 			grad := (a.At(k, i) - y.At(k, i)) / float32(batchSize) / float32(outputSize)
 			dJda.Set(k, i, grad)
@@ -246,22 +283,22 @@ func SparseCategoricalCrossEntropyLoss(y, a *AF32, denom int) float32 {
 	_ = y.At(batchSize-1, 0)
 
 	loss := float32(0)
-	for s := 0; s < batchSize; s++ {
+	for k := 0; k < batchSize; k++ {
 		// Inlined logSumExp over l
 		maxa := math32.Inf(-1)
 		for l := 0; l < outputSize; l++ {
-			if a.At(s, l) > maxa {
-				maxa = a.At(s, l)
+			if a.At(k, l) > maxa {
+				maxa = a.At(k, l)
 			}
 		}
 		suma := maxa
 		for l := 0; l < outputSize; l++ {
-			suma += math32.Exp(a.At(s, l) - maxa)
+			suma += math32.Exp(a.At(k, l) - maxa)
 		}
 
-		for t := 0; t < outputSize; t++ {
-			if y.At(s, 0) == float32(t) {
-				softmax := math32.Exp(a.At(s, t)-maxa) / suma
+		for i := 0; i < outputSize; i++ {
+			if y.At(k, 0) == float32(i) {
+				softmax := math32.Exp(a.At(k, i)-maxa) / suma
 
 				// Clamp softmax to make sure the loss is finite.
 				//
@@ -284,7 +321,7 @@ func SparseCategoricalCrossEntropyLoss(y, a *AF32, denom int) float32 {
 // y is the ground truth output.  Shape (batchSize, 1)
 // a is the layer's forward output.  Shape (batchSize, lay.OutputSize)
 // dJda (scratch) is storage for the gradient of the loss wrt a.  Shape (batchSize, lay.OutputSize)
-func SparseCategoricalCrossEntropyLossGradient(y, a, dJda *AF32, sliceMin, sliceMax int) {
+func SparseCategoricalCrossEntropyLossGradient(y, a, dJda *AF32) {
 	batchSize := a.Shape0
 	outputSize := a.Shape1
 	_ = a.At(batchSize-1, outputSize-1)
@@ -307,7 +344,7 @@ func SparseCategoricalCrossEntropyLossGradient(y, a, dJda *AF32, sliceMin, slice
 
 	// ref https://eli.thegreenplace.net/2016/the-softmax-function-and-its-derivative/
 
-	for k := sliceMin; k < sliceMax; k++ {
+	for k := 0; k < batchSize; k++ {
 		// We are taking softmax(a[k, l]) for all l.
 		//
 		// For stability, use the identity softmax(v) = softmax(v - c), and
@@ -481,145 +518,6 @@ func (net *Network) Loss(xs, ys []*AF32) float32 {
 	return loss
 }
 
-// x is the input.  Shape (batchSize, layers[0].InputSize)
-// y is the ground truth output.  Shape (batchSize, ?(dependent on loss function))
-func (net *Network) GradientDescent(x, y *AF32, alpha float32, steps int) {
-	batchSize := x.Shape0
-
-	// TODO: Very interesting.  Even with only one thread (no goroutine
-	// launches, splitting the work up into batches dramatically improves
-	// performance.)  Obvious in retrospect, I guess.
-	//
-	// Work Items | Seconds per step
-	//          1 | 20
-	//          5 | 8.6
-	//         10 | 7
-	//         20 | 6
-	//         30 | 5.2
-	//         40 | 5.2
-	//
-	// This is on the MNIST problem.  Each input sample is 784 floats, and there
-	// are 10000 training examples.  When we divide the input into 40 work
-	// units, each one has 250 samples, for a work unit size of 196000 floats, or ~765KiB
-
-	numWorkUnits := 300
-
-	dadz := make([]*AF32, len(net.Layers))
-	a := make([]*AF32, len(net.Layers))
-	djda := make([]*AF32, len(net.Layers))
-	for l := 0; l < len(net.Layers); l++ {
-		dadz[l] = MakeAF32(batchSize, net.Layers[l].OutputSize)
-		a[l] = MakeAF32(batchSize, net.Layers[l].OutputSize)
-		djda[l] = MakeAF32(batchSize, net.Layers[l].OutputSize)
-	}
-
-	// djdw and djdb need to have one replica per worker, which we then sum
-	// during the gathering step.
-	djdw := make([][]*AF32, numWorkUnits)
-	djdb := make([][]*AF32, numWorkUnits)
-	for w := 0; w < numWorkUnits; w++ {
-		djdw[w] = make([]*AF32, len(net.Layers))
-		djdb[w] = make([]*AF32, len(net.Layers))
-		for l := 0; l < len(net.Layers); l++ {
-			djdw[w][l] = MakeAF32(net.Layers[l].OutputSize, net.Layers[l].InputSize)
-			djdb[w][l] = MakeAF32(net.Layers[l].OutputSize, 1)
-		}
-	}
-
-	for s := 0; s < steps; s++ {
-		net.GradientDescentStep(x, y, alpha, numWorkUnits, dadz, a, djda, djdw, djdb)
-	}
-}
-
-func (net *Network) GradientDescentStep(x, y *AF32, alpha float32, numWorkUnits int, dadz, a, djda []*AF32, djdw, djdb [][]*AF32) {
-	batchSize := x.Shape0
-
-	// start := time.Now()
-
-	// Launch one goroutine per work unit, but make sure that we only have this
-	// many actively running at once.
-	sem := semaphore.NewWeighted(4)
-
-	wg := sync.WaitGroup{}
-	for w := 0; w < numWorkUnits; w++ {
-		w := w
-
-		// Which samples is this worker responsible for?
-		sliceSize := batchSize / numWorkUnits
-		sliceMin := w * sliceSize
-		sliceMax := (w + 1) * sliceSize
-		if w == numWorkUnits-1 {
-			sliceMax = batchSize
-		}
-
-		sem.Acquire(context.TODO(), 1)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer sem.Release(1)
-
-			// Forward application, saving the activation gradients at each layer.
-			net.Layers[0].Apply(x, a[0], dadz[0], sliceMin, sliceMax)
-			for l := 1; l < len(net.Layers); l++ {
-				net.Layers[l].Apply(a[l-1], a[l], dadz[l], sliceMin, sliceMax)
-			}
-
-			switch net.LossFunction {
-			case MeanSquaredError:
-				MeanSquaredErrorLossGradient(y, a[len(net.Layers)-1], djda[len(net.Layers)-1], sliceMin, sliceMax)
-			case SparseCategoricalCrossEntropyFromLogits:
-				SparseCategoricalCrossEntropyLossGradient(y, a[len(net.Layers)-1], djda[len(net.Layers)-1], sliceMin, sliceMax)
-			default:
-				panic("unimplemented loss function type")
-			}
-
-			// Backprop.  djdx of layer l+i is the djda of layer l.
-			//
-			// Note that we have to pick the correct per-worker slice of djdw and djdb
-			for l := len(net.Layers) - 1; l >= 1; l-- {
-				net.Layers[l].Backprop(a[l-1], djda[l], dadz[l], djdw[w][l], djdb[w][l], djda[l-1], sliceMin, sliceMax)
-			}
-			net.Layers[0].Backprop(x, djda[0], dadz[0], djdw[w][0], djdb[w][0], nil, sliceMin, sliceMax)
-		}()
-	}
-	wg.Wait()
-
-	// backpropFinished := time.Now()
-
-	for l := 0; l < len(net.Layers); l++ {
-		for i := 0; i < net.Layers[l].OutputSize; i++ {
-			for j := 0; j < net.Layers[l].InputSize; j++ {
-				// Sum up the gradients across all worker slices.
-				var djdwij float32
-				for w := 0; w < numWorkUnits; w++ {
-					djdwij += djdw[w][l].At(i, j)
-				}
-
-				newW := net.Layers[l].W.At(i, j) - alpha*djdwij
-				net.Layers[l].W.Set(i, j, newW)
-			}
-
-			// Sum up the gradients across all worker slices.
-			var djdbi float32
-			for w := 0; w < numWorkUnits; w++ {
-				djdbi += djdb[w][l].At(i, 0)
-			}
-
-			newB := net.Layers[l].B.At(i, 0) - alpha*djdbi
-			net.Layers[l].B.Set(i, 0, newB)
-		}
-	}
-
-	// weightUpdateFinished := time.Now()
-
-	// overallTime := weightUpdateFinished.Sub(start)
-	// backpropTime := backpropFinished.Sub(start)
-	// backpropPct := backpropTime.Seconds() / overallTime.Seconds() * 100.0
-	// weightUpdateTime := weightUpdateFinished.Sub(backpropFinished)
-	// weightUpdatePct := weightUpdateTime.Seconds() / overallTime.Seconds() * 100.0
-	// log.Printf("Step overall=%v applyandbackprop=%.1f update=%.1f", overallTime, backpropPct, weightUpdatePct)
-}
-
 type AdamEvaluationParameters struct {
 	step int
 
@@ -629,18 +527,15 @@ type AdamEvaluationParameters struct {
 	// Updated every step
 	beta1T, beta2T float32
 
-	batchSize    int
-	numWorkUnits int
-	numThreads   int
+	batchSize int
 
-	dadz, a, djda []*AF32
+	wTranspose []*AF32
+
+	dadz, a, djda                            []*AF32
+	dadzTranspose, aTranspose, djdaTranspose []*AF32
 
 	// The current weight gradients per-layer
 	djdw, djdb []*AF32
-
-	// The current weight gradients per-worker, per-layer.  Will be aggregated
-	// into djdw and djdb at the end of the step
-	workerDjdw, workerDjdb [][]*AF32
 
 	// The first moment vectors for each layer
 	oldMW []*AF32
@@ -654,19 +549,25 @@ type AdamEvaluationParameters struct {
 	newVW []*AF32
 	newVB []*AF32
 
-	Overall            time.Duration
-	GradientCompute    time.Duration
-	GradientReassembly time.Duration
-	MomentVectors      time.Duration
-	WeightUpdate       time.Duration
+	Timings AdamEvaluationTimings
 }
 
-func (aep *AdamEvaluationParameters) ResetTimings() {
-	aep.Overall = 0 * time.Second
-	aep.GradientCompute = 0 * time.Second
-	aep.GradientReassembly = 0 * time.Second
-	aep.MomentVectors = 0 * time.Second
-	aep.WeightUpdate = 0 * time.Second
+type AdamEvaluationTimings struct {
+	Overall         time.Duration
+	Forward         time.Duration
+	Loss            time.Duration
+	Backpropagation time.Duration
+	MomentVectors   time.Duration
+	WeightUpdate    time.Duration
+}
+
+func (t *AdamEvaluationTimings) Reset() {
+	t.Overall = 0 * time.Second
+	t.Forward = 0 * time.Second
+	t.Loss = 0 * time.Second
+	t.Backpropagation = 0 * time.Second
+	t.MomentVectors = 0 * time.Second
+	t.WeightUpdate = 0 * time.Second
 }
 
 func (aep *AdamEvaluationParameters) DumpTensors(tensors map[string]*AF32) {
@@ -679,8 +580,6 @@ func (aep *AdamEvaluationParameters) DumpTensors(tensors map[string]*AF32) {
 	tensors["adam.beta1T"] = MakeScalarAF32(aep.beta1T)
 	tensors["adam.beta2T"] = MakeScalarAF32(aep.beta2T)
 	tensors["adam.batchSize"] = MakeScalarAF32(float32(aep.batchSize))
-	tensors["adam.numWorkUnits"] = MakeScalarAF32(float32(aep.numWorkUnits))
-	tensors["adam.numThreads"] = MakeScalarAF32(float32(aep.numThreads))
 
 	// We don't save dadz, a, djda, djdw, djdb because they are scratch
 	// variables overwritten at each step.
@@ -747,14 +646,6 @@ func (aep *AdamEvaluationParameters) LoadTensors(tensors map[string]*AF32) error
 	if err != nil {
 		return err
 	}
-	aep.numWorkUnits, err = loadIntFromTensor(tensors, "adam.numWorkUnits")
-	if err != nil {
-		return err
-	}
-	aep.numThreads, err = loadIntFromTensor(tensors, "adam.numThreads")
-	if err != nil {
-		return err
-	}
 
 	for l := 0; l < len(aep.oldMW); l++ {
 		var ok bool
@@ -779,7 +670,7 @@ func (aep *AdamEvaluationParameters) LoadTensors(tensors map[string]*AF32) error
 	return nil
 }
 
-func (net *Network) MakeAdamParameters(alpha float32, batchSize, numWorkUnits, numThreads int) *AdamEvaluationParameters {
+func (net *Network) MakeAdamParameters(alpha float32, batchSize int) *AdamEvaluationParameters {
 	aep := &AdamEvaluationParameters{
 		alpha:   alpha,
 		beta1:   0.9,
@@ -789,14 +680,16 @@ func (net *Network) MakeAdamParameters(alpha float32, batchSize, numWorkUnits, n
 		beta1T: 0.9,
 		beta2T: 0.999,
 
-		batchSize:    batchSize,
-		numWorkUnits: numWorkUnits,
-		numThreads:   numThreads,
+		batchSize: batchSize,
 	}
 
+	aep.wTranspose = make([]*AF32, len(net.Layers))
 	aep.dadz = make([]*AF32, len(net.Layers))
+	aep.dadzTranspose = make([]*AF32, len(net.Layers))
 	aep.a = make([]*AF32, len(net.Layers))
+	aep.aTranspose = make([]*AF32, len(net.Layers))
 	aep.djda = make([]*AF32, len(net.Layers))
+	aep.djdaTranspose = make([]*AF32, len(net.Layers))
 	aep.djdw = make([]*AF32, len(net.Layers))
 	aep.djdb = make([]*AF32, len(net.Layers))
 	aep.oldMW = make([]*AF32, len(net.Layers))
@@ -808,9 +701,13 @@ func (net *Network) MakeAdamParameters(alpha float32, batchSize, numWorkUnits, n
 	aep.newMB = make([]*AF32, len(net.Layers))
 	aep.newVB = make([]*AF32, len(net.Layers))
 	for l := 0; l < len(net.Layers); l++ {
+		aep.wTranspose[l] = MakeAF32Transpose(net.Layers[l].W)
 		aep.dadz[l] = MakeAF32(batchSize, net.Layers[l].OutputSize)
+		aep.dadzTranspose[l] = MakeAF32Transpose(aep.dadz[l])
 		aep.a[l] = MakeAF32(batchSize, net.Layers[l].OutputSize)
+		aep.aTranspose[l] = MakeAF32Transpose(aep.a[l])
 		aep.djda[l] = MakeAF32(batchSize, net.Layers[l].OutputSize)
+		aep.djdaTranspose[l] = MakeAF32Transpose(aep.djda[l])
 		aep.djdw[l] = MakeAF32(net.Layers[l].OutputSize, net.Layers[l].InputSize)
 		aep.djdb[l] = MakeAF32(net.Layers[l].OutputSize, 1)
 		aep.oldMW[l] = MakeAF32(net.Layers[l].OutputSize, net.Layers[l].InputSize)
@@ -823,110 +720,104 @@ func (net *Network) MakeAdamParameters(alpha float32, batchSize, numWorkUnits, n
 		aep.newVB[l] = MakeAF32(net.Layers[l].OutputSize, 1)
 	}
 
-	// djdw and djdb need to have one replica per worker, which we then sum
-	// during the gathering step.
-	aep.workerDjdw = make([][]*AF32, aep.numWorkUnits)
-	aep.workerDjdb = make([][]*AF32, aep.numWorkUnits)
-	for w := 0; w < aep.numWorkUnits; w++ {
-		aep.workerDjdw[w] = make([]*AF32, len(net.Layers))
-		aep.workerDjdb[w] = make([]*AF32, len(net.Layers))
-		for l := 0; l < len(net.Layers); l++ {
-			aep.workerDjdw[w][l] = MakeAF32(net.Layers[l].OutputSize, net.Layers[l].InputSize)
-			aep.workerDjdb[w][l] = MakeAF32(net.Layers[l].OutputSize, 1)
-		}
-	}
-
 	return aep
 }
 
 // x is the input.  Shape (batchSize, layers[0].InputSize)
 // y is the ground truth output.  Shape (batchSize, ?(dependent on loss function))
-func (net *Network) Adam(x, y *AF32, alpha float32, numWorkUnits, steps int) {
+func (net *Network) Adam(x, y *AF32, alpha float32, steps int) {
 	batchSize := x.Shape0
 
-	aep := net.MakeAdamParameters(alpha, batchSize, numWorkUnits, 4)
+	aep := net.MakeAdamParameters(alpha, batchSize)
 
 	for s := 0; s < steps; s++ {
-		net.AdamStep(x, y, aep)
+		net.AdamStep(x, y, aep, 4)
 	}
 }
 
-func (net *Network) AdamStep(x, y *AF32, aep *AdamEvaluationParameters) {
+func (net *Network) AdamStep(x, y *AF32, aep *AdamEvaluationParameters, threads int) {
 	batchSize := x.Shape0
 
 	start := time.Now()
 
+	// Create transposed copies of djda, dadz, and a/x.  Backprop calculations of djdw
+	// and djdb are better with k being the inner dimension.  Backprop
+	// calculation of djdx is better with i as the inner dimension.
+	xTranspose := MakeAF32Transpose(x)
+	AF32Transpose(x, xTranspose)
+
 	// Launch one goroutine per work unit, but make sure that we only have this
 	// many actively running at once.
-	sem := semaphore.NewWeighted(int64(aep.numThreads))
+	// sem := semaphore.NewWeighted(int64(aep.numThreads))
 
-	wg := sync.WaitGroup{}
-	for w := 0; w < aep.numWorkUnits; w++ {
+	// wg := sync.WaitGroup{}
+	for w := 0; w < threads; w++ {
 		w := w
 
 		// Which samples is this worker responsible for?
-		sliceSize := batchSize / aep.numWorkUnits
+		sliceSize := batchSize / threads
 		sliceMin := w * sliceSize
 		sliceMax := (w + 1) * sliceSize
-		if w == aep.numWorkUnits-1 {
+		if w == threads-1 {
 			sliceMax = batchSize
 		}
 
-		sem.Acquire(context.TODO(), 1)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer sem.Release(1)
+		// sem.Acquire(context.TODO(), 1)
+		// wg.Add(1)
+		// go func() {
+		// 	defer wg.Done()
+		// 	defer sem.Release(1)
 
-			// Forward application, saving the activation gradients at each layer.
-			net.Layers[0].Apply(x, aep.a[0], aep.dadz[0], sliceMin, sliceMax)
-			for l := 1; l < len(net.Layers); l++ {
-				net.Layers[l].Apply(aep.a[l-1], aep.a[l], aep.dadz[l], sliceMin, sliceMax)
-			}
+		forwardStart := time.Now()
 
-			switch net.LossFunction {
-			case MeanSquaredError:
-				MeanSquaredErrorLossGradient(y, aep.a[len(net.Layers)-1], aep.djda[len(net.Layers)-1], sliceMin, sliceMax)
-			case SparseCategoricalCrossEntropyFromLogits:
-				SparseCategoricalCrossEntropyLossGradient(y, aep.a[len(net.Layers)-1], aep.djda[len(net.Layers)-1], sliceMin, sliceMax)
-			default:
-				panic("unimplemented loss function type")
-			}
-
-			// Backprop.  djdx of layer l+i is the djda of layer l.
-			//
-			// Note that we have to pick the correct per-worker slice of djdw and djdb
-			for l := len(net.Layers) - 1; l >= 1; l-- {
-				net.Layers[l].Backprop(aep.a[l-1], aep.djda[l], aep.dadz[l], aep.workerDjdw[w][l], aep.workerDjdb[w][l], aep.djda[l-1], sliceMin, sliceMax)
-			}
-			net.Layers[0].Backprop(x, aep.djda[0], aep.dadz[0], aep.workerDjdw[w][0], aep.workerDjdb[w][0], nil, sliceMin, sliceMax)
-		}()
-	}
-	wg.Wait()
-
-	gradientComputeFinished := time.Now()
-
-	// Reassemble the per-worker weight and bias gradients into a single overall
-	// weight and bias gradient.
-	for l := 0; l < len(net.Layers); l++ {
-		for i := 0; i < net.Layers[l].OutputSize; i++ {
-			for j := 0; j < net.Layers[l].InputSize; j++ {
-				var sum float32
-				for w := 0; w < aep.numWorkUnits; w++ {
-					sum += aep.workerDjdw[w][l].At(i, j)
-				}
-				aep.djdw[l].Set(i, j, sum)
-			}
-
-			var sum float32
-			for w := 0; w < aep.numWorkUnits; w++ {
-				sum += aep.workerDjdb[w][l].At(i, 0)
-			}
-			aep.djdb[l].Set(i, 0, sum)
+		// Forward application, saving the activation gradients at each layer.
+		net.Layers[0].Apply(x, aep.a[0], aep.dadz[0], sliceMin, sliceMax)
+		AF32Transpose(aep.a[0], aep.aTranspose[0])
+		AF32Transpose(aep.dadz[0], aep.dadzTranspose[0])
+		for l := 1; l < len(net.Layers); l++ {
+			net.Layers[l].Apply(aep.a[l-1], aep.a[l], aep.dadz[l], sliceMin, sliceMax)
+			AF32Transpose(aep.a[l], aep.aTranspose[l])
+			AF32Transpose(aep.dadz[l], aep.dadzTranspose[l])
 		}
+
+		aep.Timings.Forward += time.Since(forwardStart)
+
+		// }()
+	}
+	// wg.Wait()
+
+	lossStart := time.Now()
+
+	switch net.LossFunction {
+	case MeanSquaredError:
+		MeanSquaredErrorLossGradient(y, aep.a[len(net.Layers)-1], aep.djda[len(net.Layers)-1])
+	case SparseCategoricalCrossEntropyFromLogits:
+		SparseCategoricalCrossEntropyLossGradient(y, aep.a[len(net.Layers)-1], aep.djda[len(net.Layers)-1])
+	default:
+		panic("unimplemented loss function type")
 	}
 
-	gradientReassemblyFinished := time.Now()
+	aep.Timings.Loss += time.Since(lossStart)
+
+	backpropStart := time.Now()
+
+	// Backprop.  djdx of layer l+i is the djda of layer l.
+	//
+	// Note that we have to pick the correct per-worker slice of djdw and djdb
+	for l := len(net.Layers) - 1; l >= 1; l-- {
+		AF32Transpose(aep.djda[l], aep.djdaTranspose[l])
+
+		net.Layers[l].BackpropDjdw(aep.aTranspose[l-1], aep.djdaTranspose[l], aep.dadzTranspose[l], aep.djdw[l])
+		net.Layers[l].BackpropDjdb(aep.djdaTranspose[l], aep.dadzTranspose[l], aep.djdb[l])
+		net.Layers[l].BackpropDjdx(aep.djda[l], aep.dadz[l], aep.wTranspose[l], aep.djda[l-1])
+	}
+	AF32Transpose(aep.djda[0], aep.djdaTranspose[0])
+	net.Layers[0].BackpropDjdw(xTranspose, aep.djdaTranspose[0], aep.dadzTranspose[0], aep.djdw[0])
+	net.Layers[0].BackpropDjdb(aep.djdaTranspose[0], aep.dadzTranspose[0], aep.djdb[0])
+
+	aep.Timings.Backpropagation += time.Since(backpropStart)
+
+	momentVectorsStart := time.Now()
 
 	// Compute new Adam moment vectors
 	beta1 := aep.beta1
@@ -940,7 +831,11 @@ func (net *Network) AdamStep(x, y *AF32, aep *AdamEvaluationParameters) {
 				aep.newMW[l].Set(i, j, beta1*oldmw+(1-beta1)*djdw)
 				aep.newVW[l].Set(i, j, beta2*oldvw+(1-beta2)*djdw*djdw)
 			}
+		}
+	}
 
+	for l := 0; l < len(net.Layers); l++ {
+		for i := 0; i < net.Layers[l].OutputSize; i++ {
 			djdb := aep.djdb[l].At(i, 0)
 			oldmb := aep.oldMB[l].At(i, 0)
 			oldvb := aep.oldVB[l].At(i, 0)
@@ -949,7 +844,9 @@ func (net *Network) AdamStep(x, y *AF32, aep *AdamEvaluationParameters) {
 		}
 	}
 
-	momentVectorsFinished := time.Now()
+	aep.Timings.MomentVectors += time.Since(momentVectorsStart)
+
+	weightUpdateStart := time.Now()
 
 	alpha := aep.alpha
 	beta1T := aep.beta1T
@@ -966,6 +863,8 @@ func (net *Network) AdamStep(x, y *AF32, aep *AdamEvaluationParameters) {
 			newB := net.Layers[l].B.At(i, 0) - alphaT*aep.newMB[l].At(i, 0)/(math32.Sqrt(aep.newVB[l].At(i, 0))+aep.epsilon)
 			net.Layers[l].B.Set(i, 0, newB)
 		}
+
+		AF32Transpose(net.Layers[l].W, aep.wTranspose[l])
 	}
 
 	aep.beta1T *= aep.beta1
@@ -976,19 +875,9 @@ func (net *Network) AdamStep(x, y *AF32, aep *AdamEvaluationParameters) {
 	aep.oldVW, aep.newVW = aep.newVW, aep.oldVW
 	aep.oldVB, aep.newVB = aep.newVB, aep.oldVB
 
-	weightUpdateFinished := time.Now()
+	aep.Timings.WeightUpdate += time.Since(weightUpdateStart)
 
-	overallTime := weightUpdateFinished.Sub(start)
-	aep.Overall += overallTime
-	aep.GradientCompute += gradientComputeFinished.Sub(start)
-	aep.GradientReassembly += gradientReassemblyFinished.Sub(gradientComputeFinished)
-	aep.MomentVectors += momentVectorsFinished.Sub(gradientReassemblyFinished)
-	aep.WeightUpdate += weightUpdateFinished.Sub(momentVectorsFinished)
-	// gradientComputePct := gradientComputeFinished.Sub(start).Seconds() / overallTime.Seconds() * 100.0
-	// gradientReassemblyPct := gradientReassemblyFinished.Sub(gradientComputeFinished).Seconds() / overallTime.Seconds() * 100.0
-	// momentVectorsPct := momentVectorsFinished.Sub(gradientReassemblyFinished).Seconds() / overallTime.Seconds() * 100.0
-	// weightUpdatePct := weightUpdateFinished.Sub(momentVectorsFinished).Seconds() / overallTime.Seconds() * 100.0
-	// log.Printf("Step %d overall=%v gradientcompute=%.1f gradientreassembly=%.1f momentvectors=%.1f weightupdate=%.1f", aep.step, overallTime, gradientComputePct, gradientReassemblyPct, momentVectorsPct, weightUpdatePct)
+	aep.Timings.Overall += time.Since(start)
 
 	aep.step++
 }
@@ -1003,7 +892,7 @@ type Layer struct {
 	OutputSize int
 }
 
-func MakeDense(activation ActivationType, inputSize, outputSize int) *Layer {
+func MakeDense(activation ActivationType, inputSize, outputSize int, r *rand.Rand) *Layer {
 	l := &Layer{
 		Activation: activation,
 		InputSize:  inputSize,
@@ -1011,8 +900,6 @@ func MakeDense(activation ActivationType, inputSize, outputSize int) *Layer {
 		W:          MakeAF32(outputSize, inputSize),
 		B:          MakeAF32(outputSize, 1),
 	}
-
-	r := rand.New(rand.NewSource(12345))
 
 	for i := 0; i < outputSize; i++ {
 		for j := 0; j < inputSize; j++ {
@@ -1041,7 +928,8 @@ func (lay *Layer) Apply(x, a, dadz *AF32, sliceMin, sliceMax int) {
 	if x.Shape1 != inputSize {
 		panic("dimension mismatch")
 	}
-	_ = x.At(batchSize-1, inputSize-1)
+	_ = x.CheckedAt(sliceMin, inputSize-1)
+	_ = x.CheckedAt(sliceMax-1, inputSize-1)
 
 	if a.Shape0 != batchSize {
 		panic("dimension mismatch")
@@ -1049,7 +937,7 @@ func (lay *Layer) Apply(x, a, dadz *AF32, sliceMin, sliceMax int) {
 	if a.Shape1 != outputSize {
 		panic("dimension mismatch")
 	}
-	_ = a.At(batchSize-1, outputSize-1)
+	_ = a.CheckedAt(batchSize-1, outputSize-1)
 
 	if dadz != nil {
 		if dadz.Shape0 != batchSize {
@@ -1058,7 +946,7 @@ func (lay *Layer) Apply(x, a, dadz *AF32, sliceMin, sliceMax int) {
 		if dadz.Shape1 != outputSize {
 			panic("dimension mismatch")
 		}
-		_ = dadz.At(batchSize-1, outputSize-1)
+		_ = dadz.CheckedAt(batchSize-1, outputSize-1)
 	}
 
 	if lay.W.Shape0 != outputSize {
@@ -1067,7 +955,7 @@ func (lay *Layer) Apply(x, a, dadz *AF32, sliceMin, sliceMax int) {
 	if lay.W.Shape1 != inputSize {
 		panic("dimension mismatch")
 	}
-	_ = lay.W.At(outputSize-1, inputSize-1)
+	_ = lay.W.CheckedAt(outputSize-1, inputSize-1)
 
 	if lay.B.Shape0 != outputSize {
 		panic("dimension mismatch")
@@ -1075,13 +963,14 @@ func (lay *Layer) Apply(x, a, dadz *AF32, sliceMin, sliceMax int) {
 	if lay.B.Shape1 != 1 {
 		panic("dimension mismatch")
 	}
-	_ = lay.B.At(outputSize-1, 0)
+	_ = lay.B.CheckedAt(outputSize-1, 0)
 
 	// Linear part: z_ik = sum_j w_ij*x_jk + b_i
 	//
 	// TODO: Make cache-oblivious?  Need benchmarks.
-	for k := sliceMin; k < sliceMax; k++ {
-		for i := 0; i < outputSize; i++ {
+
+	for i := 0; i < outputSize; i++ {
+		for k := sliceMin; k < sliceMax; k++ {
 			var z float32
 			for j := 0; j < inputSize; j++ {
 				z += lay.W.At(i, j) * x.At(k, j)
@@ -1120,6 +1009,71 @@ func (lay *Layer) Apply(x, a, dadz *AF32, sliceMin, sliceMax int) {
 			}
 		}
 	}
+
+	// xBase := sliceMin * x.Shape1
+	// aBase := sliceMin * a.Shape1
+	// dadzBase := 0
+	// if dadz != nil {
+	// 	dadzBase = sliceMin * dadz.Shape1
+	// }
+	// for k := sliceMin; k < sliceMax; k++ {
+	// 	wBase := 0
+	// 	for i := 0; i < outputSize; i++ {
+	// 		var z float32
+	// 		for j := 0; j < inputSize; j++ {
+	// 			// z += lay.W.At(i, j) * x.At(k, j)
+	// 			z += lay.W.At1(wBase+j) * x.At1(xBase+j)
+	// 		}
+	// 		// z += lay.B.At(i, 0)
+	// 		z += lay.B.At1(i)
+
+	// 		switch lay.Activation {
+	// 		case ReLU:
+	// 			if z <= 0 {
+	// 				// a.Set(k, i, 0)
+	// 				a.Set1(aBase+i, 0)
+	// 			} else {
+	// 				// a.Set(k, i, z)
+	// 				a.Set1(aBase+i, z)
+	// 			}
+	// 		case Linear:
+	// 			// a.Set(k, i, z)
+	// 			a.Set1(aBase+i, z)
+	// 		case Sigmoid:
+	// 			// a.Set(k, i, 1/(1+math32.Exp(-z)))
+	// 			a.Set1(aBase+i, 1/(1+math32.Exp(-z)))
+	// 		default:
+	// 			panic("unhandled activation function")
+	// 		}
+
+	// 		if dadz != nil {
+	// 			switch lay.Activation {
+	// 			case Linear:
+	// 				// dadz.Set(k, i, 1)
+	// 				dadz.Set1(dadzBase+i, 1)
+	// 			case ReLU:
+	// 				if z <= 0 {
+	// 					// dadz.Set(k, i, 0)
+	// 					dadz.Set1(dadzBase+i, 0)
+	// 				} else {
+	// 					// dadz.Set(k, i, 1)
+	// 					dadz.Set1(dadzBase+i, 1)
+	// 				}
+	// 			case Sigmoid:
+	// 				tmp := math32.Exp(-z)
+	// 				// dadz.Set(k, i, -tmp/(1+tmp)/(1+tmp))
+	// 				dadz.Set1(dadzBase+i, -tmp/(1+tmp)/(1+tmp))
+	// 			}
+	// 		}
+
+	// 		wBase += lay.W.Shape1
+	// 	}
+	// 	xBase += x.Shape1
+	// 	aBase += a.Shape1
+	// 	if dadz != nil {
+	// 		dadzBase += dadz.Shape1
+	// 	}
+	// }
 }
 
 // x (input) is the layer input.  Shape (batchSize, lay.InputSize)
@@ -1129,7 +1083,8 @@ func (lay *Layer) Apply(x, a, dadz *AF32, sliceMin, sliceMax int) {
 // dJdb (output) is the gradient of the loss wrt lay.B.  Shape (lay.OutputSize, 1)
 // dJdx (output) is the gradient of the loss wrt x.  Shape (batchSize, lay.InputSize)
 // [sliceMin, sliceMax) is the range of samples we should compute over (used for parallelization)
-func (lay *Layer) Backprop(x, dJda, dadz, dJdw, dJdb, dJdx *AF32, sliceMin, sliceMax int) {
+func (lay *Layer) BackpropDjdw(xTranspose, dJdaTranspose, dadzTranspose, dJdw *AF32) {
+	batchSize := xTranspose.Shape1
 	inputSize := lay.InputSize
 	outputSize := lay.OutputSize
 
@@ -1137,34 +1092,41 @@ func (lay *Layer) Backprop(x, dJda, dadz, dJdw, dJdb, dJdx *AF32, sliceMin, slic
 	for i := 0; i < outputSize; i++ {
 		for j := 0; j < inputSize; j++ {
 			var grad float32
-			for k := sliceMin; k < sliceMax; k++ {
-				grad += dJda.At(k, i) * dadz.At(k, i) * x.At(k, j)
+			for k := 0; k < batchSize; k++ {
+				grad += dJdaTranspose.At(i, k) * dadzTranspose.At(i, k) * xTranspose.At(j, k)
 			}
 			dJdw.Set(i, j, grad)
 		}
 	}
+}
+
+func (lay *Layer) BackpropDjdb(dJdaTranspose, dadzTranspose, dJdb *AF32) {
+	batchSize := dJdaTranspose.Shape1
+	outputSize := lay.OutputSize
 
 	// Compute gradient of loss with respect to biases.
 	for i := 0; i < outputSize; i++ {
 		var grad float32
-		for k := sliceMin; k < sliceMax; k++ {
-			grad += dJda.At(k, i) * dadz.At(k, i)
+		for k := 0; k < batchSize; k++ {
+			grad += dJdaTranspose.At(i, k) * dadzTranspose.At(i, k)
 		}
 		dJdb.Set(i, 0, grad)
 	}
+}
 
-	// Compute gradient of loss with respect to x.  Optional because we don't do
-	// it for layer 0.
-	if dJdx != nil {
-		for j := 0; j < inputSize; j++ {
-			for k := sliceMin; k < sliceMax; k++ {
-				var grad float32
-				for i := 0; i < lay.OutputSize; i++ {
-					grad += dJda.At(k, i) * dadz.At(k, i) * lay.W.At(i, j)
-				}
-				dJdx.Set(k, j, grad)
+func (lay *Layer) BackpropDjdx(dJda, dadz, wTranspose, dJdx *AF32) {
+	batchSize := dJda.Shape0
+	inputSize := lay.InputSize
+	outputSize := lay.OutputSize
+
+	// Compute gradient of loss with respect to x.
+	for j := 0; j < inputSize; j++ {
+		for k := 0; k < batchSize; k++ {
+			var grad float32
+			for i := 0; i < outputSize; i++ {
+				grad += dJda.At(k, i) * dadz.At(k, i) * wTranspose.At(j, i)
 			}
+			dJdx.Set(k, j, grad)
 		}
 	}
-
 }
