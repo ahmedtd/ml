@@ -903,9 +903,9 @@ func MakeDense(activation ActivationType, inputSize, outputSize int, r *rand.Ran
 
 	for i := 0; i < outputSize; i++ {
 		for j := 0; j < inputSize; j++ {
-			l.W.Set(i, j, r.Float32())
+			l.W.Set(i, j, float32(r.NormFloat64())*0.1)
 		}
-		l.B.Set(i, 0, r.Float32())
+		l.B.Set(i, 0, 0.1)
 	}
 
 	return l
