@@ -4,6 +4,7 @@ go 1.20
 
 require (
 	github.com/chewxy/math32 v1.10.1
+	github.com/google/go-cmp v0.5.8
 	github.com/google/subcommands v1.2.0
 	github.com/mmcloughlin/avo v0.6.0
 	github.com/sbinet/npyio v0.8.0

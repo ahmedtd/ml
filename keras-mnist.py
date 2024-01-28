@@ -1,6 +1,10 @@
 import tensorflow as tf
 import tensorflow_datasets as tfds
 
+tf.config.threading.set_inter_op_parallelism_threads(1)
+tf.config.threading.set_intra_op_parallelism_threads(1)
+
+
 (ds_train, ds_test), ds_info = tfds.load(
     'mnist',
     split=['train', 'test'],

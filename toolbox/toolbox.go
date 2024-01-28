@@ -480,7 +480,7 @@ func (net *Network) Apply(x *AF32) *AF32 {
 		a1.Shape0 = batchSize
 		a1.Shape1 = net.Layers[l].OutputSize
 
-		net.Layers[l].Apply(a0, a1, nil, 0, batchSize) // no need to save activation gradients
+		net.Layers[l].Apply(a0, a1, nil) // no need to save activation gradients
 
 		// This layer's output becomes the input for the next layer.
 		a0, a1 = a1, a0
@@ -736,8 +736,6 @@ func (net *Network) Adam(x, y *AF32, alpha float32, steps int) {
 }
 
 func (net *Network) AdamStep(x, y *AF32, aep *AdamEvaluationParameters, threads int) {
-	batchSize := x.Shape0
-
 	start := time.Now()
 
 	// Create transposed copies of djda, dadz, and a/x.  Backprop calculations of djdw
@@ -746,45 +744,19 @@ func (net *Network) AdamStep(x, y *AF32, aep *AdamEvaluationParameters, threads 
 	xTranspose := MakeAF32Transpose(x)
 	AF32Transpose(x, xTranspose)
 
-	// Launch one goroutine per work unit, but make sure that we only have this
-	// many actively running at once.
-	// sem := semaphore.NewWeighted(int64(aep.numThreads))
+	forwardStart := time.Now()
 
-	// wg := sync.WaitGroup{}
-	for w := 0; w < threads; w++ {
-		w := w
-
-		// Which samples is this worker responsible for?
-		sliceSize := batchSize / threads
-		sliceMin := w * sliceSize
-		sliceMax := (w + 1) * sliceSize
-		if w == threads-1 {
-			sliceMax = batchSize
-		}
-
-		// sem.Acquire(context.TODO(), 1)
-		// wg.Add(1)
-		// go func() {
-		// 	defer wg.Done()
-		// 	defer sem.Release(1)
-
-		forwardStart := time.Now()
-
-		// Forward application, saving the activation gradients at each layer.
-		net.Layers[0].Apply(x, aep.a[0], aep.dadz[0], sliceMin, sliceMax)
-		AF32Transpose(aep.a[0], aep.aTranspose[0])
-		AF32Transpose(aep.dadz[0], aep.dadzTranspose[0])
-		for l := 1; l < len(net.Layers); l++ {
-			net.Layers[l].Apply(aep.a[l-1], aep.a[l], aep.dadz[l], sliceMin, sliceMax)
-			AF32Transpose(aep.a[l], aep.aTranspose[l])
-			AF32Transpose(aep.dadz[l], aep.dadzTranspose[l])
-		}
-
-		aep.Timings.Forward += time.Since(forwardStart)
-
-		// }()
+	// Forward application, saving the activation gradients at each layer.
+	net.Layers[0].Apply(x, aep.a[0], aep.dadz[0])
+	AF32Transpose(aep.a[0], aep.aTranspose[0])
+	AF32Transpose(aep.dadz[0], aep.dadzTranspose[0])
+	for l := 1; l < len(net.Layers); l++ {
+		net.Layers[l].Apply(aep.a[l-1], aep.a[l], aep.dadz[l])
+		AF32Transpose(aep.a[l], aep.aTranspose[l])
+		AF32Transpose(aep.dadz[l], aep.dadzTranspose[l])
 	}
-	// wg.Wait()
+
+	aep.Timings.Forward += time.Since(forwardStart)
 
 	lossStart := time.Now()
 
@@ -917,7 +889,7 @@ func MakeDense(activation ActivationType, inputSize, outputSize int, r *rand.Ran
 // a (output) is the layer's forward output.  Shape (batchSize, lay.OutputSize)
 // dadz (output, optional) is the derivative of the activated output wrt the linear output.  Shape (batchSize, lay.OutputSize)
 // [sliceMin, sliceMax) is the range of samples we should compute over (used for parallelization)
-func (lay *Layer) Apply(x, a, dadz *AF32, sliceMin, sliceMax int) {
+func (lay *Layer) Apply(x, a, dadz *AF32) {
 	batchSize := x.Shape0
 	inputSize := lay.InputSize
 	outputSize := lay.OutputSize
@@ -928,8 +900,8 @@ func (lay *Layer) Apply(x, a, dadz *AF32, sliceMin, sliceMax int) {
 	if x.Shape1 != inputSize {
 		panic("dimension mismatch")
 	}
-	_ = x.CheckedAt(sliceMin, inputSize-1)
-	_ = x.CheckedAt(sliceMax-1, inputSize-1)
+	_ = x.CheckedAt(0, inputSize-1)
+	_ = x.CheckedAt(batchSize-1, inputSize-1)
 
 	if a.Shape0 != batchSize {
 		panic("dimension mismatch")
@@ -968,7 +940,7 @@ func (lay *Layer) Apply(x, a, dadz *AF32, sliceMin, sliceMax int) {
 	iBase := 0
 	for i := 0; i < outputSize; i++ {
 		kBase := 0
-		for k := sliceMin; k < sliceMax; k++ {
+		for k := 0; k < batchSize; k++ {
 			z := denseDot2(inputSize, lay.W.V, iBase, x.V, kBase)
 			z += lay.B.At(i, 0)
 
@@ -1014,23 +986,33 @@ func (lay *Layer) Apply(x, a, dadz *AF32, sliceMin, sliceMax int) {
 // djdaT (input) is the gradient of the loss wrt a.  Shape (lay.OutputSize, batchSize)
 // dadzT (input) is the gradient of a_ik wrt z_ik.  Shape (lay.OutputSize, batchSize)
 // dJdw (output) is the gradient of the loss wrt lay.W.  Shape (lay.OutputSize, lay.InputSize)
-func (lay *Layer) BackpropDjdw(xT, djdaT, dadzT, dJdw *AF32) {
+func (lay *Layer) BackpropDjdw(xT, djdaT, dadzT, djdw *AF32) {
 	batchSize := xT.Shape1
 	inputSize := lay.InputSize
 	outputSize := lay.OutputSize
 
-	// Compute gradient of loss with respect to weights.
-	iBase := 0
-	for i := 0; i < outputSize; i++ {
-		jBase := 0
-		for j := 0; j < inputSize; j++ {
-			grad := denseDot3(batchSize, xT.V, jBase, djdaT.V, iBase, dadzT.V, iBase)
-			dJdw.Set(i, j, grad)
+	// This function is equivalent to:
+	//
+	// for i := 0; i < outputSize; i++ {
+	// 	for j := 0; j < inputSize; j++ {
+	// 		var grad float32
+	// 		for k := 0; k < batchSize; k++ {
+	// 			grad += djdaT.At(i, k) * dadzT.At(i, k) * xT.At(j, k)
+	// 		}
+	// 		djdw.Set(i, j, grad)
+	// 	}
+	// }
 
-			jBase += batchSize * 4
-		}
-		iBase += batchSize * 4
-	}
+	denseBackpropDjdwSliceKernel(
+		batchSize,
+		inputSize,
+		djdaT.V,
+		dadzT.V,
+		xT.V,
+		djdw.V,
+		0, 0,
+		outputSize*inputSize,
+	)
 }
 
 // djdaT (input) is the gradient of the loss wrt a.  Shape (lay.OutputSize, batchSize)
@@ -1075,3 +1057,4 @@ func (lay *Layer) BackpropDjdx(djda, dadz, wT, dJdx *AF32) {
 
 //go:generate go run asm_dense_dot_2.go -out dense_dot_2.s -stubs stub_dense_dot_2.go
 //go:generate go run asm_dense_dot_3.go -out dense_dot_3.s -stubs stub_dense_dot_3.go
+//go:generate go run ./asm-generators/asm_dense_backprop_djdw_slice.go -out dense_backprop_djdw_slice.s -stubs stub_dense_backprop_djdw_slice.go
