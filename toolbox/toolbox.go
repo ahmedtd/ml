@@ -965,16 +965,11 @@ func (lay *Layer) Apply(x, a, dadz *AF32, sliceMin, sliceMax int) {
 	}
 	_ = lay.B.CheckedAt(outputSize-1, 0)
 
-	// Linear part: z_ik = sum_j w_ij*x_jk + b_i
-	//
-	// TODO: Make cache-oblivious?  Need benchmarks.
-
+	iBase := 0
 	for i := 0; i < outputSize; i++ {
+		kBase := 0
 		for k := sliceMin; k < sliceMax; k++ {
-			var z float32
-			for j := 0; j < inputSize; j++ {
-				z += lay.W.At(i, j) * x.At(k, j)
-			}
+			z := denseDot2(inputSize, lay.W.V, iBase, x.V, kBase)
 			z += lay.B.At(i, 0)
 
 			switch lay.Activation {
@@ -1007,126 +1002,76 @@ func (lay *Layer) Apply(x, a, dadz *AF32, sliceMin, sliceMax int) {
 					dadz.Set(k, i, -tmp/(1+tmp)/(1+tmp))
 				}
 			}
+
+			kBase += inputSize * 4
 		}
+
+		iBase += inputSize * 4
 	}
-
-	// xBase := sliceMin * x.Shape1
-	// aBase := sliceMin * a.Shape1
-	// dadzBase := 0
-	// if dadz != nil {
-	// 	dadzBase = sliceMin * dadz.Shape1
-	// }
-	// for k := sliceMin; k < sliceMax; k++ {
-	// 	wBase := 0
-	// 	for i := 0; i < outputSize; i++ {
-	// 		var z float32
-	// 		for j := 0; j < inputSize; j++ {
-	// 			// z += lay.W.At(i, j) * x.At(k, j)
-	// 			z += lay.W.At1(wBase+j) * x.At1(xBase+j)
-	// 		}
-	// 		// z += lay.B.At(i, 0)
-	// 		z += lay.B.At1(i)
-
-	// 		switch lay.Activation {
-	// 		case ReLU:
-	// 			if z <= 0 {
-	// 				// a.Set(k, i, 0)
-	// 				a.Set1(aBase+i, 0)
-	// 			} else {
-	// 				// a.Set(k, i, z)
-	// 				a.Set1(aBase+i, z)
-	// 			}
-	// 		case Linear:
-	// 			// a.Set(k, i, z)
-	// 			a.Set1(aBase+i, z)
-	// 		case Sigmoid:
-	// 			// a.Set(k, i, 1/(1+math32.Exp(-z)))
-	// 			a.Set1(aBase+i, 1/(1+math32.Exp(-z)))
-	// 		default:
-	// 			panic("unhandled activation function")
-	// 		}
-
-	// 		if dadz != nil {
-	// 			switch lay.Activation {
-	// 			case Linear:
-	// 				// dadz.Set(k, i, 1)
-	// 				dadz.Set1(dadzBase+i, 1)
-	// 			case ReLU:
-	// 				if z <= 0 {
-	// 					// dadz.Set(k, i, 0)
-	// 					dadz.Set1(dadzBase+i, 0)
-	// 				} else {
-	// 					// dadz.Set(k, i, 1)
-	// 					dadz.Set1(dadzBase+i, 1)
-	// 				}
-	// 			case Sigmoid:
-	// 				tmp := math32.Exp(-z)
-	// 				// dadz.Set(k, i, -tmp/(1+tmp)/(1+tmp))
-	// 				dadz.Set1(dadzBase+i, -tmp/(1+tmp)/(1+tmp))
-	// 			}
-	// 		}
-
-	// 		wBase += lay.W.Shape1
-	// 	}
-	// 	xBase += x.Shape1
-	// 	aBase += a.Shape1
-	// 	if dadz != nil {
-	// 		dadzBase += dadz.Shape1
-	// 	}
-	// }
 }
 
-// x (input) is the layer input.  Shape (batchSize, lay.InputSize)
-// dJda (input) is the gradient of the loss wrt a.  Shape (batchSize, lay.OutputSize)
-// dadz (input) is the gradient of a_ik wrt z_ik.  Shape (batchSize, lay.OutputSize).
+// xT (input) is the layer input.  Shape (lay.InputSize, batchSize)
+// djdaT (input) is the gradient of the loss wrt a.  Shape (lay.OutputSize, batchSize)
+// dadzT (input) is the gradient of a_ik wrt z_ik.  Shape (lay.OutputSize, batchSize)
 // dJdw (output) is the gradient of the loss wrt lay.W.  Shape (lay.OutputSize, lay.InputSize)
-// dJdb (output) is the gradient of the loss wrt lay.B.  Shape (lay.OutputSize, 1)
-// dJdx (output) is the gradient of the loss wrt x.  Shape (batchSize, lay.InputSize)
-// [sliceMin, sliceMax) is the range of samples we should compute over (used for parallelization)
-func (lay *Layer) BackpropDjdw(xTranspose, dJdaTranspose, dadzTranspose, dJdw *AF32) {
-	batchSize := xTranspose.Shape1
+func (lay *Layer) BackpropDjdw(xT, djdaT, dadzT, dJdw *AF32) {
+	batchSize := xT.Shape1
 	inputSize := lay.InputSize
 	outputSize := lay.OutputSize
 
 	// Compute gradient of loss with respect to weights.
+	iBase := 0
 	for i := 0; i < outputSize; i++ {
+		jBase := 0
 		for j := 0; j < inputSize; j++ {
-			var grad float32
-			for k := 0; k < batchSize; k++ {
-				grad += dJdaTranspose.At(i, k) * dadzTranspose.At(i, k) * xTranspose.At(j, k)
-			}
+			grad := denseDot3(batchSize, xT.V, jBase, djdaT.V, iBase, dadzT.V, iBase)
 			dJdw.Set(i, j, grad)
+
+			jBase += batchSize * 4
 		}
+		iBase += batchSize * 4
 	}
 }
 
-func (lay *Layer) BackpropDjdb(dJdaTranspose, dadzTranspose, dJdb *AF32) {
-	batchSize := dJdaTranspose.Shape1
+// djdaT (input) is the gradient of the loss wrt a.  Shape (lay.OutputSize, batchSize)
+// dadzT (input) is the gradient of a_ik wrt z_ik.  Shape (lay.OutputSize, batchSize)
+// dJdb (output) is the gradient of the loss wrt lay.B.  Shape (lay.OutputSize, 1)
+func (lay *Layer) BackpropDjdb(djdaT, dadzT, dJdb *AF32) {
+	batchSize := djdaT.Shape1
 	outputSize := lay.OutputSize
 
 	// Compute gradient of loss with respect to biases.
+	iBase := 0
 	for i := 0; i < outputSize; i++ {
-		var grad float32
-		for k := 0; k < batchSize; k++ {
-			grad += dJdaTranspose.At(i, k) * dadzTranspose.At(i, k)
-		}
+		grad := denseDot2(batchSize, djdaT.V, iBase, dadzT.V, iBase)
 		dJdb.Set(i, 0, grad)
+
+		iBase += batchSize * 4
 	}
 }
 
-func (lay *Layer) BackpropDjdx(dJda, dadz, wTranspose, dJdx *AF32) {
-	batchSize := dJda.Shape0
+// dJda (input) is the gradient of the loss wrt a.  Shape (batchSize, lay.OutputSize)
+// dadz (input) is the gradient of a_ik wrt z_ik.  Shape (batchSize, lay.OutputSize)
+// wT (input) is the layer weights, tranposed.  Shape (inputSize, outputSize)
+// dJdx (output) is the gradient of the loss wrt x.  Shape (batchSize, lay.InputSize)
+func (lay *Layer) BackpropDjdx(djda, dadz, wT, dJdx *AF32) {
+	batchSize := djda.Shape0
 	inputSize := lay.InputSize
 	outputSize := lay.OutputSize
 
 	// Compute gradient of loss with respect to x.
+	jBase := 0
 	for j := 0; j < inputSize; j++ {
+		kBase := 0
 		for k := 0; k < batchSize; k++ {
-			var grad float32
-			for i := 0; i < outputSize; i++ {
-				grad += dJda.At(k, i) * dadz.At(k, i) * wTranspose.At(j, i)
-			}
+			grad := denseDot3(outputSize, djda.V, kBase, dadz.V, kBase, wT.V, jBase)
 			dJdx.Set(k, j, grad)
+
+			kBase += outputSize * 4
 		}
+		jBase += outputSize * 4
 	}
 }
+
+//go:generate go run asm_dense_dot_2.go -out dense_dot_2.s -stubs stub_dense_dot_2.go
+//go:generate go run asm_dense_dot_3.go -out dense_dot_3.s -stubs stub_dense_dot_3.go
