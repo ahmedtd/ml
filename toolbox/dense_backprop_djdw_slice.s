@@ -21,31 +21,29 @@ TEXT ·denseBackpropDjdwSliceKernel(SB), NOSPLIT, $0-136
 
 	// The outer loop, running over elements of djdw in-order
 outerLoop:
-	CMPQ   DI, $0x00000000
-	JE     outerLoopExit
+	CMPQ DI, $0x00000000
+	JE   outerLoopExit
+
+	// Make copies of djdaPtr, dadzPtr, and xTPtr
+	MOVQ   $0x00000004, R11
+	IMULQ  AX, R11
+	IMULQ  R8, R11
+	ADDQ   DX, R11
+	MOVQ   $0x00000004, R12
+	IMULQ  AX, R12
+	IMULQ  R8, R12
+	ADDQ   BX, R12
+	MOVQ   $0x00000004, R13
+	IMULQ  AX, R13
+	IMULQ  R9, R13
+	ADDQ   SI, R13
+	MOVQ   AX, R14
 	VXORPS Y0, Y0, Y0
 	VXORPS Y1, Y1, Y1
 	VXORPS Y2, Y2, Y2
 	VXORPS Y3, Y3, Y3
 	VXORPS Y4, Y4, Y4
 	VXORPS Y5, Y5, Y5
-
-	// Make copies of djdaPtr, dadzPtr, and xTPtr
-	MOVQ  $0x00000004, R11
-	IMULQ AX, R11
-	IMULQ R8, R11
-	ADDQ  DX, R11
-	MOVQ  $0x00000004, R12
-	IMULQ AX, R12
-	IMULQ R8, R12
-	ADDQ  BX, R12
-	MOVQ  $0x00000004, R13
-	IMULQ AX, R13
-	IMULQ R9, R13
-	ADDQ  SI, R13
-
-	// The inner loop, running over batchSize elements of djdaT, dadzT, and xT in-order
-	MOVQ AX, R14
 
 dotproductblockloop:
 	CMPQ        R14, $0x00000030
@@ -80,11 +78,11 @@ dotproducttail:
 dotproducttailloop:
 	CMPQ        R14, $0x00000000
 	JE          dotproductreduce
-	VMOVSS      (R12), X7
-	VMULSS      (R11), X7, X7
+	VMOVSS      (R11), X7
+	VMULSS      (R12), X7, X7
 	VFMADD231SS (R13), X7, X6
-	ADDQ        $0x00000004, R12
 	ADDQ        $0x00000004, R11
+	ADDQ        $0x00000004, R12
 	ADDQ        $0x00000004, R13
 	DECQ        R14
 	JMP         dotproducttailloop

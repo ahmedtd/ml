@@ -937,13 +937,31 @@ func (lay *Layer) Apply(x, a, dadz *AF32) {
 	}
 	_ = lay.B.CheckedAt(outputSize-1, 0)
 
-	iBase := 0
-	for i := 0; i < outputSize; i++ {
-		kBase := 0
-		for k := 0; k < batchSize; k++ {
-			z := denseDot2(inputSize, lay.W.V, iBase, x.V, kBase)
-			z += lay.B.At(i, 0)
+	// Write the linear activations into a.  Equivalent to
+	//
+	// for k := 0; k < batchSize; k++ {
+	// 	for i := 0; i < outputSize; i++ {
+	// 		var z float32
+	// 		for j := 0; j < inputSize; j++ {
+	// 			z += lay.W.At(i, j) * x.At(k, j)
+	// 		}
+	// 		z += lay.B.At(i, 0)
+	// 		a.Set(k, i, z)
+	// 	}
+	// }
+	denseApplyLinearSliceKernel(
+		outputSize, inputSize,
+		x.V, lay.W.V, lay.B.V,
+		a.V,
+		0, 0,
+		batchSize*outputSize,
+	)
 
+	// Apply activation function to a elementwise.  Store activation gradients
+	// in dadz if provided.
+	for k := 0; k < batchSize; k++ {
+		for i := 0; i < outputSize; i++ {
+			z := a.At(k, i)
 			switch lay.Activation {
 			case ReLU:
 				if z <= 0 {
@@ -974,11 +992,7 @@ func (lay *Layer) Apply(x, a, dadz *AF32) {
 					dadz.Set(k, i, -tmp/(1+tmp)/(1+tmp))
 				}
 			}
-
-			kBase += inputSize * 4
 		}
-
-		iBase += inputSize * 4
 	}
 }
 
@@ -1036,25 +1050,37 @@ func (lay *Layer) BackpropDjdb(djdaT, dadzT, dJdb *AF32) {
 // dadz (input) is the gradient of a_ik wrt z_ik.  Shape (batchSize, lay.OutputSize)
 // wT (input) is the layer weights, tranposed.  Shape (inputSize, outputSize)
 // dJdx (output) is the gradient of the loss wrt x.  Shape (batchSize, lay.InputSize)
-func (lay *Layer) BackpropDjdx(djda, dadz, wT, dJdx *AF32) {
+func (lay *Layer) BackpropDjdx(djda, dadz, wT, djdx *AF32) {
 	batchSize := djda.Shape0
 	inputSize := lay.InputSize
 	outputSize := lay.OutputSize
 
-	// Compute gradient of loss with respect to x.
-	jBase := 0
-	for j := 0; j < inputSize; j++ {
-		kBase := 0
-		for k := 0; k < batchSize; k++ {
-			grad := denseDot3(outputSize, djda.V, kBase, dadz.V, kBase, wT.V, jBase)
-			dJdx.Set(k, j, grad)
+	// This function is equivalent to:
+	//
+	// for k := 0; k < batchSize; k++ {
+	// 	for j := 0; j < inputSize; j++ {
+	// 		var grad float32
+	// 		for i := 0; i < outputSize; i++ {
+	// 			grad += djda.At(k, i) * dadz.At(k, i) * wT.At(j, i)
+	// 		}
+	// 		djdx.Set(k, j, grad)
+	// 	}
+	// }
 
-			kBase += outputSize * 4
-		}
-		jBase += outputSize * 4
-	}
+	// Cheat and reuse the djdw kernel.
+	denseBackpropDjdwSliceKernel(
+		outputSize,
+		inputSize,
+		djda.V,
+		dadz.V,
+		wT.V,
+		djdx.V,
+		0, 0,
+		batchSize*inputSize,
+	)
 }
 
 //go:generate go run asm_dense_dot_2.go -out dense_dot_2.s -stubs stub_dense_dot_2.go
 //go:generate go run asm_dense_dot_3.go -out dense_dot_3.s -stubs stub_dense_dot_3.go
-//go:generate go run ./asm-generators/asm_dense_backprop_djdw_slice.go -out dense_backprop_djdw_slice.s -stubs stub_dense_backprop_djdw_slice.go
+//go:generate go run ./asm-generators/dense-backprop-djdw-slice -out dense_backprop_djdw_slice.s -stubs stub_dense_backprop_djdw_slice.go
+//go:generate go run ./asm-generators/dense-apply-linear-slice -out dense_apply_linear_slice.s -stubs stub_dense_apply_linear_slice.go

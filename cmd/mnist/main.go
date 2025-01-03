@@ -134,7 +134,7 @@ func (c *TrainCommand) executeErr(ctx context.Context) error {
 		}
 	}
 
-	for epoch := 0; epoch < 40; epoch++ {
+	for epoch := 0; epoch < 2; epoch++ {
 		for batch := 0; batch < len(xs); batch++ {
 			net.AdamStep(xs[batch], ys[batch], aep, 1)
 		}
