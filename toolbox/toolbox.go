@@ -949,13 +949,13 @@ func (lay *Layer) Apply(x, a, dadz *AF32) {
 	// 		a.Set(k, i, z)
 	// 	}
 	// }
-	denseApplyLinearSliceKernel(
-		outputSize, inputSize,
-		x.V, lay.W.V, lay.B.V,
-		a.V,
-		0, 0,
-		batchSize*outputSize,
-	)
+	for k := 0; k < batchSize; k++ {
+		for i := 0; i < outputSize; i++ {
+			z := denseDot2SIMD(lay.W.V[i*inputSize:i*inputSize+inputSize], x.V[k*inputSize:k*inputSize+inputSize])
+			z += lay.B.At(i, 0)
+			a.Set(k, i, z)
+		}
+	}
 
 	// Apply activation function to a elementwise.  Store activation gradients
 	// in dadz if provided.
@@ -1017,16 +1017,16 @@ func (lay *Layer) BackpropDjdw(xT, djdaT, dadzT, djdw *AF32) {
 	// 	}
 	// }
 
-	denseBackpropDjdwSliceKernel(
-		batchSize,
-		inputSize,
-		djdaT.V,
-		dadzT.V,
-		xT.V,
-		djdw.V,
-		0, 0,
-		outputSize*inputSize,
-	)
+	for i := 0; i < outputSize; i++ {
+		for j := 0; j < inputSize; j++ {
+			grad := denseDot3SIMD(
+				djdaT.V[i*batchSize:i*batchSize+batchSize],
+				dadzT.V[i*batchSize:i*batchSize+batchSize],
+				xT.V[j*batchSize:j*batchSize+batchSize],
+			)
+			djdw.Set(i, j, grad)
+		}
+	}
 }
 
 // djdaT (input) is the gradient of the loss wrt a.  Shape (lay.OutputSize, batchSize)
@@ -1039,10 +1039,10 @@ func (lay *Layer) BackpropDjdb(djdaT, dadzT, dJdb *AF32) {
 	// Compute gradient of loss with respect to biases.
 	iBase := 0
 	for i := 0; i < outputSize; i++ {
-		grad := denseDot2(batchSize, djdaT.V, iBase, dadzT.V, iBase)
+		grad := denseDot2SIMD(djdaT.V[iBase:iBase+batchSize], dadzT.V[iBase:iBase+batchSize])
 		dJdb.Set(i, 0, grad)
 
-		iBase += batchSize * 4
+		iBase += batchSize
 	}
 }
 
@@ -1067,20 +1067,14 @@ func (lay *Layer) BackpropDjdx(djda, dadz, wT, djdx *AF32) {
 	// 	}
 	// }
 
-	// Cheat and reuse the djdw kernel.
-	denseBackpropDjdwSliceKernel(
-		outputSize,
-		inputSize,
-		djda.V,
-		dadz.V,
-		wT.V,
-		djdx.V,
-		0, 0,
-		batchSize*inputSize,
-	)
+	for k := 0; k < batchSize; k++ {
+		for j := 0; j < inputSize; j++ {
+			grad := denseDot3SIMD(
+				djda.V[k*outputSize:k*outputSize+outputSize],
+				dadz.V[k*outputSize:k*outputSize+outputSize],
+				wT.V[j*outputSize:j*outputSize+outputSize],
+			)
+			djdx.Set(k, j, grad)
+		}
+	}
 }
-
-//go:generate go run asm_dense_dot_2.go -out dense_dot_2.s -stubs stub_dense_dot_2.go
-//go:generate go run asm_dense_dot_3.go -out dense_dot_3.s -stubs stub_dense_dot_3.go
-//go:generate go run ./asm-generators/dense-backprop-djdw-slice -out dense_backprop_djdw_slice.s -stubs stub_dense_backprop_djdw_slice.go
-//go:generate go run ./asm-generators/dense-apply-linear-slice -out dense_apply_linear_slice.s -stubs stub_dense_apply_linear_slice.go

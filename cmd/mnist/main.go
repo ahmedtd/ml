@@ -92,24 +92,26 @@ func (c *TrainCommand) executeErr(ctx context.Context) error {
 
 	// Group training data into batches, discarding the last
 	// partially-full batch.
-	batchSize := 128
+	batchSize := 2048
 	xs := []*toolbox.AF32{}
 	ys := []*toolbox.AF32{}
-	for batch := 0; batch < xTrain.Shape0/batchSize; batch++ {
-		sliceStart := batch * batchSize
 
+	sliceStart := 0
+	for sliceStart < xTrain.Shape0 {
 		x := toolbox.MakeAF32(batchSize, xTrain.Shape1)
 		y := toolbox.MakeAF32(batchSize, yTrain.Shape1)
 		for k := 0; k < batchSize; k++ {
 			for j := 0; j < xTrain.Shape1; j++ {
-				x.Set(k, j, xTrain.At(k+sliceStart, j))
+				x.Set(k, j, xTrain.At((sliceStart+k)%xTrain.Shape0, j))
 			}
 			for j := 0; j < yTrain.Shape1; j++ {
-				y.Set(k, j, yTrain.At(k+sliceStart, j))
+				y.Set(k, j, yTrain.At((sliceStart+k)%xTrain.Shape0, j))
 			}
 		}
 		xs = append(xs, x)
 		ys = append(ys, y)
+
+		sliceStart += batchSize
 	}
 
 	log.Printf("Data loaded and batched into %d batches", len(xs))
@@ -126,7 +128,7 @@ func (c *TrainCommand) executeErr(ctx context.Context) error {
 	}
 
 	// TODO: Use 4 threads instead of 1 thread
-	aep := net.MakeAdamParameters(0.001, batchSize)
+	aep := net.MakeAdamParameters(0.01, batchSize)
 
 	if c.fromCheckpointFile != "" {
 		if err := c.loadCheckpoint(net, aep); err != nil {
@@ -134,7 +136,7 @@ func (c *TrainCommand) executeErr(ctx context.Context) error {
 		}
 	}
 
-	for epoch := 0; epoch < 2; epoch++ {
+	for epoch := 0; epoch < 5; epoch++ {
 		for batch := 0; batch < len(xs); batch++ {
 			net.AdamStep(xs[batch], ys[batch], aep, 1)
 		}
@@ -187,7 +189,13 @@ func (c *TrainCommand) executeErr(ctx context.Context) error {
 		}
 		testPercent := float32(numCorrectTest) / float32(yTest.Shape0) * float32(100)
 
-		log.Printf("epoch %d training-loss=%f training-pct=%.1f testing-loss=%f testing-pct=%.1f", epoch, net.Loss(xs, ys), trainPercent, net.Loss([]*toolbox.AF32{xTest}, []*toolbox.AF32{yTest}), testPercent)
+		log.Printf("epoch %d training-loss=%f training-pct=%.1f testing-loss=%f testing-pct=%.1f",
+			epoch,
+			net.Loss(xs, ys),
+			trainPercent,
+			net.Loss([]*toolbox.AF32{xTest}, []*toolbox.AF32{yTest}),
+			testPercent,
+		)
 		log.Printf("epoch %d timings overall=%.1f forward=%.1f loss=%.1f backprop=%.1f momentvectors=%.1f weightupdate=%.1f",
 			epoch,
 			aep.Timings.Overall.Seconds(),
