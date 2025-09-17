@@ -491,31 +491,15 @@ func (net *Network) Apply(x *AF32) *AF32 {
 
 // xs is the input batches. Shape (batchSize, layers[0].InputSize)
 // ys is the ground truth output batches.  Shape (batchSize, ?(dependent on loss function))
-func (net *Network) Loss(xs, ys []*AF32) float32 {
-	numSamples := 0
-	for i := 0; i < len(xs); i++ {
-		if xs[i].Shape0 != ys[i].Shape0 {
-			panic("dimension mismatch")
-		}
-
-		numSamples += xs[i].Shape0
+func (net *Network) Loss(ys, predictions *AF32, totalSamples int) float32 {
+	switch net.LossFunction {
+	case MeanSquaredError:
+		return MeanSquaredErrorLoss(ys, predictions, totalSamples)
+	case SparseCategoricalCrossEntropyFromLogits:
+		return SparseCategoricalCrossEntropyLoss(ys, predictions, totalSamples)
+	default:
+		panic("unimplemented loss function type")
 	}
-
-	loss := float32(0)
-	for i := 0; i < len(xs); i++ {
-		a := net.Apply(xs[i])
-
-		switch net.LossFunction {
-		case MeanSquaredError:
-			loss += MeanSquaredErrorLoss(ys[i], a, numSamples)
-		case SparseCategoricalCrossEntropyFromLogits:
-			loss += SparseCategoricalCrossEntropyLoss(ys[i], a, numSamples)
-		default:
-			panic("unimplemented loss function type")
-		}
-	}
-
-	return loss
 }
 
 type AdamEvaluationParameters struct {

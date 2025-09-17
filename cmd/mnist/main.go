@@ -191,9 +191,9 @@ func (c *TrainCommand) executeErr(ctx context.Context) error {
 
 		log.Printf("epoch %d training-loss=%f training-pct=%.1f testing-loss=%f testing-pct=%.1f",
 			epoch,
-			net.Loss(xs, ys),
+			net.Loss(yTrain, trainPred, xTrain.Shape0),
 			trainPercent,
-			net.Loss([]*toolbox.AF32{xTest}, []*toolbox.AF32{yTest}),
+			net.Loss(yTest, testPred, xTest.Shape0),
 			testPercent,
 		)
 		log.Printf("epoch %d timings overall=%.1f forward=%.1f loss=%.1f backprop=%.1f momentvectors=%.1f weightupdate=%.1f",
