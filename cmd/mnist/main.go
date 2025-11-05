@@ -97,16 +97,14 @@ func (c *TrainCommand) executeErr(ctx context.Context) error {
 	ys := []*toolbox.AF32{}
 
 	sliceStart := 0
-	for sliceStart < xTrain.Shape0 {
-		x := toolbox.MakeAF32(batchSize, xTrain.Shape1)
-		y := toolbox.MakeAF32(batchSize, yTrain.Shape1)
+	for sliceStart < xTrain.Shape[0] {
+		x := toolbox.MakeAF32(batchSize, xTrain.Shape[1])
+		y := toolbox.MakeAF32(batchSize)
 		for k := 0; k < batchSize; k++ {
-			for j := 0; j < xTrain.Shape1; j++ {
-				x.Set(k, j, xTrain.At((sliceStart+k)%xTrain.Shape0, j))
+			for j := 0; j < xTrain.Shape[1]; j++ {
+				x.Set2(k, j, xTrain.At2((sliceStart+k)%xTrain.Shape[0], j))
 			}
-			for j := 0; j < yTrain.Shape1; j++ {
-				y.Set(k, j, yTrain.At((sliceStart+k)%xTrain.Shape0, j))
-			}
+			y.Set1(k, yTrain.At1((sliceStart+k)%xTrain.Shape[0]))
 		}
 		xs = append(xs, x)
 		ys = append(ys, y)
@@ -154,46 +152,46 @@ func (c *TrainCommand) executeErr(ctx context.Context) error {
 		// Check performance on the train data set
 		trainPred := net.Apply(xTrain)
 		numCorrectTrain := 0
-		for k := 0; k < trainPred.Shape0; k++ {
+		for k := 0; k < trainPred.Shape[0]; k++ {
 			digit := 0
 			score := math32.Inf(-1)
 			for i := 0; i < 10; i++ {
-				if trainPred.At(k, i) > score {
+				if trainPred.At2(k, i) > score {
 					digit = i
-					score = trainPred.At(k, i)
+					score = trainPred.At2(k, i)
 				}
 			}
 
-			if float32(digit) == yTrain.At(k, 0) {
+			if float32(digit) == yTrain.At1(k) {
 				numCorrectTrain++
 			}
 		}
-		trainPercent := float32(numCorrectTrain) / float32(yTrain.Shape0) * float32(100)
+		trainPercent := float32(numCorrectTrain) / float32(yTrain.Shape[0]) * float32(100)
 
 		// Check performance on the test data set.
 		testPred := net.Apply(xTest)
 		numCorrectTest := 0
-		for k := 0; k < testPred.Shape0; k++ {
+		for k := 0; k < testPred.Shape[0]; k++ {
 			digit := 0
 			score := math32.Inf(-1)
 			for i := 0; i < 10; i++ {
-				if testPred.At(k, i) > score {
+				if testPred.At2(k, i) > score {
 					digit = i
-					score = testPred.At(k, i)
+					score = testPred.At2(k, i)
 				}
 			}
 
-			if float32(digit) == yTest.At(k, 0) {
+			if float32(digit) == yTest.At1(k) {
 				numCorrectTest++
 			}
 		}
-		testPercent := float32(numCorrectTest) / float32(yTest.Shape0) * float32(100)
+		testPercent := float32(numCorrectTest) / float32(yTest.Shape[0]) * float32(100)
 
 		log.Printf("epoch %d training-loss=%f training-pct=%.1f testing-loss=%f testing-pct=%.1f",
 			epoch,
-			net.Loss(yTrain, trainPred, xTrain.Shape0),
+			net.Loss(yTrain, trainPred, xTrain.Shape[0]),
 			trainPercent,
-			net.Loss(yTest, testPred, xTest.Shape0),
+			net.Loss(yTest, testPred, xTest.Shape[0]),
 			testPercent,
 		)
 		log.Printf("epoch %d timings overall=%.1f forward=%.1f loss=%.1f backprop=%.1f momentvectors=%.1f weightupdate=%.1f",
@@ -313,7 +311,7 @@ func loadLabels(r *npz.Reader, name string) (*toolbox.AF32, error) {
 		return nil, fmt.Errorf("while reading uint8 array")
 	}
 
-	result := toolbox.MakeAF32(header.Descr.Shape[0], 1)
+	result := toolbox.MakeAF32(header.Descr.Shape[0])
 	for i := 0; i < len(raw); i++ {
 		result.V[i] = float32(raw[i])
 	}

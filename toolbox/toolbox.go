@@ -18,47 +18,78 @@ import (
 //   go build -gcflags="-d=ssa/check_bce" ./toolbox/
 
 type AF32 struct {
-	V      []float32
-	Shape0 int
-	Shape1 int
+	V     []float32
+	Shape []int
 }
 
-func MakeAF32(shape0, shape1 int) *AF32 {
-	if shape0 <= 0 {
-		panic(fmt.Sprintf("invalid shape value: %v", shape0))
+func MakeAF32(shape ...int) *AF32 {
+	for _, s := range shape {
+		if s <= 0 {
+			panic(fmt.Sprintf("invalid shape: %v", shape))
+		}
 	}
-	if shape1 <= 0 {
-		panic(fmt.Sprintf("invalid shape value: %v", shape1))
+	size := 1
+	for _, s := range shape {
+		size *= s
 	}
 
 	return &AF32{
-		V:      make([]float32, shape0*shape1),
-		Shape0: shape0,
-		Shape1: shape1,
+		V:     make([]float32, size),
+		Shape: shape,
 	}
 }
 
 func MakeScalarAF32(scalar float32) *AF32 {
 	return &AF32{
-		V:      []float32{scalar},
-		Shape0: 1,
-		Shape1: 1,
+		V:     []float32{scalar},
+		Shape: []int{1},
 	}
 }
 
-func MakeAF32Transpose(in *AF32) *AF32 {
+func AF32Copy(in *AF32) *AF32 {
+	shapeCopy := make([]int, len(in.Shape))
+	copy(shapeCopy, in.Shape)
 	return &AF32{
-		V:      make([]float32, in.Shape0*in.Shape1),
-		Shape0: in.Shape1,
-		Shape1: in.Shape0,
+		V:     make([]float32, len(in.V)),
+		Shape: shapeCopy,
 	}
 }
 
 func AF32Transpose(in *AF32, out *AF32) {
-	for i := 0; i < in.Shape0; i++ {
-		for j := 0; j < in.Shape1; j++ {
-			out.Set(j, i, in.At(i, j))
+	if len(in.Shape) != 2 {
+		panic("cannot transpose if len(shape) != 2")
+	}
+	if len(in.V) != len(out.V) {
+		panic("output storage is not correctly sized to store the transpose of the input")
+	}
+	out.Shape = []int{in.Shape[1], in.Shape[0]}
+
+	for i := 0; i < in.Shape[0]; i++ {
+		for j := 0; j < in.Shape[1]; j++ {
+			out.Set2(j, i, in.At2(i, j))
 		}
+	}
+}
+
+// AF32Reshape reshapes the input tensor.  The overall number of elements must
+// be the same.  The returned tensor shares storage with the input tensor (no
+// data is copied).
+func AF32Reshape(a *AF32, shape ...int) *AF32 {
+	newSize := 1
+	for _, s := range shape {
+		if s <= 0 {
+			panic(fmt.Sprintf("invalid shape: %v", shape))
+		}
+		newSize *= s
+	}
+
+	if newSize != len(a.V) {
+		panic("invalid reshape")
+	}
+
+	return &AF32{
+		V:     a.V,
+		Shape: shape,
 	}
 }
 
@@ -69,15 +100,22 @@ func (a *AF32) At1(idx int) float32 {
 	// return a.V[idx]
 }
 
-func (a *AF32) At(idx0, idx1 int) float32 {
-	pBase := unsafe.Pointer(unsafe.SliceData(a.V))
-	pElt := (*float32)(unsafe.Pointer(uintptr(pBase) + uintptr(idx0*a.Shape1*4+idx1*4)))
-	return *pElt
-	// return a.V[idx0*a.Shape1+idx1]
+func (a *AF32) At2(idx0, idx1 int) float32 {
+	if len(a.Shape) != 2 {
+		panic("At2() invalid for len(shape) != 2")
+	}
+	return a.V[idx0*a.Shape[1]+idx1]
 }
 
-func (a *AF32) CheckedAt(idx0, idx1 int) float32 {
-	return a.V[idx0*a.Shape1+idx1]
+func (a *AF32) At3(idx0, idx1, idx2 int) float32 {
+	if len(a.Shape) != 3 {
+		panic("At3() invalid for len(shape) != 3")
+	}
+	return a.V[idx0*a.Shape[1]*a.Shape[2]+idx1*a.Shape[2]+idx2]
+}
+
+func (a *AF32) CheckedAt3(idx0, idx1, idx2 int) float32 {
+	return a.V[idx0*a.Shape[1]*a.Shape[2]+idx1*a.Shape[2]+idx2]
 }
 
 func (a *AF32) Set1(idx int, v float32) {
@@ -87,11 +125,11 @@ func (a *AF32) Set1(idx int, v float32) {
 	// a.V[idx] = v
 }
 
-func (a *AF32) Set(idx0, idx1 int, v float32) {
-	pBase := unsafe.Pointer(unsafe.SliceData(a.V))
-	pElt := (*float32)(unsafe.Pointer(uintptr(pBase) + uintptr(idx0*a.Shape1*4+idx1*4)))
-	*pElt = v
-	// a.V[idx0*a.Shape1+idx1] = v
+func (a *AF32) Set2(idx0, idx1 int, v float32) {
+	if len(a.Shape) != 2 {
+		panic("Set2() invalid for len(shape) != 2")
+	}
+	a.V[idx0*a.Shape[1]+idx1] = v
 }
 
 func WriteSafeTensors(w io.Writer, tensors map[string]*AF32) error {
@@ -111,7 +149,7 @@ func WriteSafeTensors(w io.Writer, tensors map[string]*AF32) error {
 
 		header[k] = SafeTensorInfo{
 			DType:       "F32",
-			Shape:       []int{tensors[k].Shape0, tensors[k].Shape1},
+			Shape:       tensors[k].Shape,
 			DataOffsets: []int{begin, end},
 		}
 	}
@@ -161,16 +199,18 @@ func ReadSafeTensors(r io.Reader) (map[string]*AF32, error) {
 		if hdr.DType != "F32" {
 			return nil, fmt.Errorf("unsupported dtype %s", hdr.DType)
 		}
-		if len(hdr.Shape) != 2 {
+		if len(hdr.Shape) > 3 {
 			return nil, fmt.Errorf("unsupported shape %v", hdr.Shape)
 		}
+
+		size := 1
 		for _, s := range hdr.Shape {
 			if s < 1 {
 				return nil, fmt.Errorf("bad shape %v", hdr.Shape)
 			}
+			size *= s
 		}
 
-		size := hdr.Shape[0] * hdr.Shape[1]
 		sizeBytes := size * 4
 		valBytes := make([]byte, sizeBytes)
 		if _, err := rat.ReadAt(valBytes, 8+int64(headerLen)+int64(hdr.DataOffsets[0])); err != nil {
@@ -178,9 +218,10 @@ func ReadSafeTensors(r io.Reader) (map[string]*AF32, error) {
 		}
 
 		tensor := &AF32{
-			V:      castToF32(valBytes),
-			Shape0: hdr.Shape[0],
-			Shape1: hdr.Shape[1],
+			V:     castToF32(valBytes),
+			Shape: hdr.Shape,
+		}
+		if len(hdr.Shape) <= 3 {
 		}
 
 		tensors[k] = tensor
@@ -213,21 +254,24 @@ const (
 // a is the layer's forward output.  Shape (batchSize, lay.OutputSize)
 // denom is the total number of samples we will calculate the loss over.  Useful for computing the loss over a set of batches.
 func MeanSquaredErrorLoss(y, a *AF32, denom int) float32 {
-	if y.Shape0 != a.Shape0 {
-		panic("dimension mismatch")
+	if len(y.Shape) != 2 {
+		panic("len(y.Shape) != 2")
 	}
-	if y.Shape1 != a.Shape1 {
-		panic("dimension mismatch")
+	if len(a.Shape) != 2 {
+		panic("len(a.Shape) != 2")
+	}
+	if !slices.Equal(y.Shape, a.Shape) {
+		panic("y and a must have same shape")
 	}
 
-	batchSize := y.Shape0
-	outputSize := y.Shape1
+	batchSize := y.Shape[0]
+	outputSize := y.Shape[1]
 
 	loss := float32(0)
 
 	for k := 0; k < batchSize; k++ {
 		for i := 0; i < outputSize; i++ {
-			diff := a.At(k, i) - y.At(k, i)
+			diff := a.At2(k, i) - y.At2(k, i)
 			loss += diff * diff / 2 / float32(denom) / float32(outputSize)
 		}
 	}
@@ -239,66 +283,62 @@ func MeanSquaredErrorLoss(y, a *AF32, denom int) float32 {
 // a is the layer's forward output.  Shape (batchSize, lay.OutputSize)
 // dJda (output) is storage for the gradient of the loss wrt a.  Shape (batchSize, lay.OutputSize)
 func MeanSquaredErrorLossGradient(y, a, dJda *AF32) {
-	batchSize := a.Shape0
-	outputSize := a.Shape1
-	_ = a.At(batchSize-1, outputSize-1)
+	if len(y.Shape) != 2 {
+		panic("len(y.Shape) != 2")
+	}
+	if !slices.Equal(y.Shape, a.Shape) {
+		panic("y and a must have same shape")
+	}
+	if !slices.Equal(y.Shape, dJda.Shape) {
+		panic("y and dJda must have same shape")
+	}
 
-	if y.Shape0 != batchSize {
-		panic("dimension mismatch")
-	}
-	if y.Shape1 != outputSize {
-		panic("dimension mismatch")
-	}
-	_ = y.At(batchSize-1, outputSize-1)
+	batchSize := a.Shape[0]
+	outputSize := a.Shape[1]
 
-	if dJda.Shape0 != batchSize {
-		panic("dimension mismatch")
-	}
-	if dJda.Shape1 != outputSize {
-		panic("dimension mismatch")
-	}
-	_ = dJda.At(batchSize-1, outputSize-1)
+	// Hints to help with bounds-check elimination
+	_ = a.At2(batchSize-1, outputSize-1)
+	_ = y.At2(batchSize-1, outputSize-1)
+	_ = dJda.At2(batchSize-1, outputSize-1)
 
 	for k := 0; k < batchSize; k++ {
 		for i := 0; i < outputSize; i++ {
-			grad := (a.At(k, i) - y.At(k, i)) / float32(batchSize) / float32(outputSize)
-			dJda.Set(k, i, grad)
+			grad := (a.At2(k, i) - y.At2(k, i)) / float32(batchSize) / float32(outputSize)
+			dJda.Set2(k, i, grad)
 		}
 	}
 }
 
-// y is the ground truth output.  Shape (batchSize, 1)
+// y is the ground truth output.  Shape (batchSize)
 // a is the layer's forward output.  Shape (batchSize, lay.OutputSize)
 func SparseCategoricalCrossEntropyLoss(y, a *AF32, denom int) float32 {
-	batchSize := a.Shape0
-	outputSize := a.Shape1
-	_ = a.At(batchSize-1, outputSize-1)
+	if len(a.Shape) != 2 {
+		panic("len(a.Shape) != 2")
+	}
+	batchSize := a.Shape[0]
+	outputSize := a.Shape[1]
 
-	if y.Shape0 != batchSize {
-		panic("dimension mismatch")
+	if !slices.Equal(y.Shape, []int{batchSize}) {
+		panic("y.Shape != {batchSize}")
 	}
-	if y.Shape1 != 1 {
-		panic("dimension mismatch")
-	}
-	_ = y.At(batchSize-1, 0)
 
 	loss := float32(0)
 	for k := 0; k < batchSize; k++ {
 		// Inlined logSumExp over l
 		maxa := math32.Inf(-1)
 		for l := 0; l < outputSize; l++ {
-			if a.At(k, l) > maxa {
-				maxa = a.At(k, l)
+			if a.At2(k, l) > maxa {
+				maxa = a.At2(k, l)
 			}
 		}
 		suma := maxa
 		for l := 0; l < outputSize; l++ {
-			suma += math32.Exp(a.At(k, l) - maxa)
+			suma += math32.Exp(a.At2(k, l) - maxa)
 		}
 
 		for i := 0; i < outputSize; i++ {
-			if y.At(k, 0) == float32(i) {
-				softmax := math32.Exp(a.At(k, i)-maxa) / suma
+			if y.At1(k) == float32(i) {
+				softmax := math32.Exp(a.At2(k, i)-maxa) / suma
 
 				// Clamp softmax to make sure the loss is finite.
 				//
@@ -318,29 +358,27 @@ func SparseCategoricalCrossEntropyLoss(y, a *AF32, denom int) float32 {
 	return loss
 }
 
-// y is the ground truth output.  Shape (batchSize, 1)
+// y is the ground truth output.  Shape (batchSize)
 // a is the layer's forward output.  Shape (batchSize, lay.OutputSize)
 // dJda (scratch) is storage for the gradient of the loss wrt a.  Shape (batchSize, lay.OutputSize)
 func SparseCategoricalCrossEntropyLossGradient(y, a, dJda *AF32) {
-	batchSize := a.Shape0
-	outputSize := a.Shape1
-	_ = a.At(batchSize-1, outputSize-1)
+	if len(a.Shape) != 2 {
+		panic("len(a.Shape) != 2")
+	}
+	batchSize := a.Shape[0]
+	outputSize := a.Shape[1]
 
-	if y.Shape0 != batchSize {
-		panic("dimension mismatch")
+	if !slices.Equal(y.Shape, []int{batchSize}) {
+		panic("y.Shape != {batchSize}")
 	}
-	if y.Shape1 != 1 {
-		panic("dimension mismatch")
+	if !slices.Equal(dJda.Shape, []int{batchSize, outputSize}) {
+		panic("dJda.Shape != {batchSize, outputSize}")
 	}
-	_ = y.At(batchSize-1, 0)
 
-	if dJda.Shape0 != batchSize {
-		panic("dimension mismatch")
-	}
-	if dJda.Shape1 != outputSize {
-		panic("dimension mismatch")
-	}
-	_ = dJda.At(batchSize-1, outputSize-1)
+	// Hints for bounds-check elimination.
+	_ = a.At2(batchSize-1, outputSize-1)
+	_ = y.At1(batchSize - 1)
+	_ = dJda.At2(batchSize-1, outputSize-1)
 
 	// ref https://eli.thegreenplace.net/2016/the-softmax-function-and-its-derivative/
 
@@ -355,18 +393,18 @@ func SparseCategoricalCrossEntropyLossGradient(y, a, dJda *AF32) {
 
 		maxa := math32.Inf(-1)
 		for l := 0; l < outputSize; l++ {
-			if a.At(k, l) > maxa {
-				maxa = a.At(k, l)
+			if a.At2(k, l) > maxa {
+				maxa = a.At2(k, l)
 			}
 		}
 
 		var sum float32
 		for l := 0; l < outputSize; l++ {
-			sum += math32.Exp(a.At(k, l) - maxa)
+			sum += math32.Exp(a.At2(k, l) - maxa)
 		}
 
 		for i := 0; i < outputSize; i++ {
-			softmax := math32.Exp(a.At(k, i)-maxa) / sum
+			softmax := math32.Exp(a.At2(k, i)-maxa) / sum
 
 			// Clamp softmax to make sure the loss is finite.
 			//
@@ -378,10 +416,10 @@ func SparseCategoricalCrossEntropyLossGradient(y, a, dJda *AF32) {
 				softmax = 1 - 1e-7
 			}
 
-			if y.At(k, 0) == float32(i) {
-				dJda.Set(k, i, (softmax-1)/float32(batchSize))
+			if y.At1(k) == float32(i) {
+				dJda.Set2(k, i, (softmax-1)/float32(batchSize))
 			} else {
-				dJda.Set(k, i, (softmax-0)/float32(batchSize))
+				dJda.Set2(k, i, (softmax-0)/float32(batchSize))
 			}
 		}
 	}
@@ -405,10 +443,9 @@ func (net *Network) LoadTensors(tensors map[string]*AF32) error {
 		if !ok {
 			return fmt.Errorf("no entry for %s", weightKey)
 		}
-		gotWeightShape := []int{weightTensor.Shape0, weightTensor.Shape1}
 		wantWeightShape := []int{net.Layers[l].OutputSize, net.Layers[l].InputSize}
-		if !slices.Equal(gotWeightShape, wantWeightShape) {
-			return fmt.Errorf("wrong shape; got %v want %v", gotWeightShape, wantWeightShape)
+		if !slices.Equal(weightTensor.Shape, wantWeightShape) {
+			return fmt.Errorf("wrong shape; got %v want %v", weightTensor.Shape, wantWeightShape)
 		}
 		net.Layers[l].W = weightTensor
 
@@ -417,10 +454,9 @@ func (net *Network) LoadTensors(tensors map[string]*AF32) error {
 		if !ok {
 			return fmt.Errorf("no entry for %s", biasKey)
 		}
-		gotBiasShape := []int{biasTensor.Shape0, biasTensor.Shape1}
 		wantBiasShape := []int{net.Layers[l].OutputSize, 1}
-		if !slices.Equal(gotBiasShape, wantBiasShape) {
-			return fmt.Errorf("wrong shape; got %v want %v", gotBiasShape, wantBiasShape)
+		if !slices.Equal(biasTensor.Shape, wantBiasShape) {
+			return fmt.Errorf("wrong shape; got %v want %v", biasTensor.Shape, wantBiasShape)
 		}
 		net.Layers[l].B = biasTensor
 	}
@@ -437,10 +473,10 @@ func (net *Network) DumpTensors(tensors map[string]*AF32) {
 
 // x is the input.  Shape (batchSize, layers[0].InputSize)
 func (net *Network) Apply(x *AF32) *AF32 {
-	batchSize := x.Shape0
+	batchSize := x.Shape[0]
 
 	// Collect max-sized layer output needed.
-	maxOutputSize := x.Shape1
+	maxOutputSize := x.Shape[1]
 	for l := 0; l < len(net.Layers); l++ {
 		if net.Layers[l].OutputSize > maxOutputSize {
 			maxOutputSize = net.Layers[l].OutputSize
@@ -450,35 +486,32 @@ func (net *Network) Apply(x *AF32) *AF32 {
 	// Make this in a weird way because we're going to keep resizing them as we
 	// move forward through the layers.
 	a0 := &AF32{
-		V:      make([]float32, 0, batchSize*maxOutputSize),
-		Shape0: 0,
-		Shape1: 0,
+		V:     make([]float32, 0, batchSize*maxOutputSize),
+		Shape: []int{0, 0},
 	}
 	z := &AF32{
-		V:      make([]float32, 0, batchSize*maxOutputSize),
-		Shape0: 0,
-		Shape1: 0,
+		V:     make([]float32, 0, batchSize*maxOutputSize),
+		Shape: []int{0, 0},
 	}
 	a1 := &AF32{
-		V:      make([]float32, 0, batchSize*maxOutputSize),
-		Shape0: 0,
-		Shape1: 1,
+		V:     make([]float32, 0, batchSize*maxOutputSize),
+		Shape: []int{0, 0},
 	}
 
 	// Copy the input into a0
-	a0.V = a0.V[:batchSize*x.Shape1]
-	a0.Shape0 = batchSize
-	a0.Shape1 = x.Shape1
+	a0.V = a0.V[:batchSize*x.Shape[1]]
+	a0.Shape[0] = batchSize
+	a0.Shape[1] = x.Shape[1]
 	copy(a0.V, x.V)
 
 	for l := 0; l < len(net.Layers); l++ {
 		// Resize our outputs correctly for this layer.
 		z.V = z.V[:batchSize*net.Layers[l].OutputSize]
-		z.Shape0 = batchSize
-		z.Shape1 = net.Layers[l].OutputSize
+		z.Shape[0] = batchSize
+		z.Shape[1] = net.Layers[l].OutputSize
 		a1.V = a1.V[:batchSize*net.Layers[l].OutputSize]
-		a1.Shape0 = batchSize
-		a1.Shape1 = net.Layers[l].OutputSize
+		a1.Shape[0] = batchSize
+		a1.Shape[1] = net.Layers[l].OutputSize
 
 		net.Layers[l].Apply(a0, a1, nil) // no need to save activation gradients
 
@@ -555,7 +588,7 @@ func (t *AdamEvaluationTimings) Reset() {
 }
 
 func (aep *AdamEvaluationParameters) DumpTensors(tensors map[string]*AF32) {
-	// This is garbage -- save scalars as 1x1 tensors
+	// This is garbage -- save scalars as {1} tensors
 	tensors["adam.step"] = MakeScalarAF32(float32(aep.step))
 	tensors["adam.alpha"] = MakeScalarAF32(aep.alpha)
 	tensors["adam.beta1"] = MakeScalarAF32(aep.beta1)
@@ -584,7 +617,7 @@ func loadIntFromTensor(tensors map[string]*AF32, key string) (int, error) {
 	if !ok {
 		return 0, fmt.Errorf("missing tensor %s", key)
 	}
-	return int(tensor.At(0, 0)), nil
+	return int(tensor.At1(0)), nil
 }
 
 func loadFloat32FromTensor(tensors map[string]*AF32, key string) (float32, error) {
@@ -593,7 +626,7 @@ func loadFloat32FromTensor(tensors map[string]*AF32, key string) (float32, error
 		return 0, fmt.Errorf("missing tensor %s", key)
 	}
 
-	return tensor.At(0, 0), nil
+	return tensor.At1(0), nil
 }
 
 func (aep *AdamEvaluationParameters) LoadTensors(tensors map[string]*AF32) error {
@@ -685,13 +718,13 @@ func (net *Network) MakeAdamParameters(alpha float32, batchSize int) *AdamEvalua
 	aep.newMB = make([]*AF32, len(net.Layers))
 	aep.newVB = make([]*AF32, len(net.Layers))
 	for l := 0; l < len(net.Layers); l++ {
-		aep.wTranspose[l] = MakeAF32Transpose(net.Layers[l].W)
+		aep.wTranspose[l] = AF32Copy(net.Layers[l].W)
 		aep.dadz[l] = MakeAF32(batchSize, net.Layers[l].OutputSize)
-		aep.dadzTranspose[l] = MakeAF32Transpose(aep.dadz[l])
+		aep.dadzTranspose[l] = AF32Copy(aep.dadz[l])
 		aep.a[l] = MakeAF32(batchSize, net.Layers[l].OutputSize)
-		aep.aTranspose[l] = MakeAF32Transpose(aep.a[l])
+		aep.aTranspose[l] = AF32Copy(aep.a[l])
 		aep.djda[l] = MakeAF32(batchSize, net.Layers[l].OutputSize)
-		aep.djdaTranspose[l] = MakeAF32Transpose(aep.djda[l])
+		aep.djdaTranspose[l] = AF32Copy(aep.djda[l])
 		aep.djdw[l] = MakeAF32(net.Layers[l].OutputSize, net.Layers[l].InputSize)
 		aep.djdb[l] = MakeAF32(net.Layers[l].OutputSize, 1)
 		aep.oldMW[l] = MakeAF32(net.Layers[l].OutputSize, net.Layers[l].InputSize)
@@ -710,7 +743,7 @@ func (net *Network) MakeAdamParameters(alpha float32, batchSize int) *AdamEvalua
 // x is the input.  Shape (batchSize, layers[0].InputSize)
 // y is the ground truth output.  Shape (batchSize, ?(dependent on loss function))
 func (net *Network) Adam(x, y *AF32, alpha float32, steps int) {
-	batchSize := x.Shape0
+	batchSize := x.Shape[0]
 
 	aep := net.MakeAdamParameters(alpha, batchSize)
 
@@ -725,7 +758,7 @@ func (net *Network) AdamStep(x, y *AF32, aep *AdamEvaluationParameters, threads 
 	// Create transposed copies of djda, dadz, and a/x.  Backprop calculations of djdw
 	// and djdb are better with k being the inner dimension.  Backprop
 	// calculation of djdx is better with i as the inner dimension.
-	xTranspose := MakeAF32Transpose(x)
+	xTranspose := AF32Copy(x)
 	AF32Transpose(x, xTranspose)
 
 	forwardStart := time.Now()
@@ -781,22 +814,22 @@ func (net *Network) AdamStep(x, y *AF32, aep *AdamEvaluationParameters, threads 
 	for l := 0; l < len(net.Layers); l++ {
 		for i := 0; i < net.Layers[l].OutputSize; i++ {
 			for j := 0; j < net.Layers[l].InputSize; j++ {
-				djdw := aep.djdw[l].At(i, j)
-				oldmw := aep.oldMW[l].At(i, j)
-				oldvw := aep.oldVW[l].At(i, j)
-				aep.newMW[l].Set(i, j, beta1*oldmw+(1-beta1)*djdw)
-				aep.newVW[l].Set(i, j, beta2*oldvw+(1-beta2)*djdw*djdw)
+				djdw := aep.djdw[l].At2(i, j)
+				oldmw := aep.oldMW[l].At2(i, j)
+				oldvw := aep.oldVW[l].At2(i, j)
+				aep.newMW[l].Set2(i, j, beta1*oldmw+(1-beta1)*djdw)
+				aep.newVW[l].Set2(i, j, beta2*oldvw+(1-beta2)*djdw*djdw)
 			}
 		}
 	}
 
 	for l := 0; l < len(net.Layers); l++ {
 		for i := 0; i < net.Layers[l].OutputSize; i++ {
-			djdb := aep.djdb[l].At(i, 0)
-			oldmb := aep.oldMB[l].At(i, 0)
-			oldvb := aep.oldVB[l].At(i, 0)
-			aep.newMB[l].Set(i, 0, beta1*oldmb+(1-beta1)*djdb)
-			aep.newVB[l].Set(i, 0, beta2*oldvb+(1-beta2)*djdb*djdb)
+			djdb := aep.djdb[l].At2(i, 0)
+			oldmb := aep.oldMB[l].At2(i, 0)
+			oldvb := aep.oldVB[l].At2(i, 0)
+			aep.newMB[l].Set1(i, beta1*oldmb+(1-beta1)*djdb)
+			aep.newVB[l].Set1(i, beta2*oldvb+(1-beta2)*djdb*djdb)
 		}
 	}
 
@@ -812,12 +845,12 @@ func (net *Network) AdamStep(x, y *AF32, aep *AdamEvaluationParameters, threads 
 	for l := 0; l < len(net.Layers); l++ {
 		for i := 0; i < net.Layers[l].OutputSize; i++ {
 			for j := 0; j < net.Layers[l].InputSize; j++ {
-				newW := net.Layers[l].W.At(i, j) - alphaT*aep.newMW[l].At(i, j)/(math32.Sqrt(aep.newVW[l].At(i, j))+aep.epsilon)
-				net.Layers[l].W.Set(i, j, newW)
+				newW := net.Layers[l].W.At2(i, j) - alphaT*aep.newMW[l].At2(i, j)/(math32.Sqrt(aep.newVW[l].At2(i, j))+aep.epsilon)
+				net.Layers[l].W.Set2(i, j, newW)
 			}
 
-			newB := net.Layers[l].B.At(i, 0) - alphaT*aep.newMB[l].At(i, 0)/(math32.Sqrt(aep.newVB[l].At(i, 0))+aep.epsilon)
-			net.Layers[l].B.Set(i, 0, newB)
+			newB := net.Layers[l].B.At1(i) - alphaT*aep.newMB[l].At1(i)/(math32.Sqrt(aep.newVB[l].At1(i))+aep.epsilon)
+			net.Layers[l].B.Set1(i, newB)
 		}
 
 		AF32Transpose(net.Layers[l].W, aep.wTranspose[l])
@@ -842,7 +875,7 @@ type Layer struct {
 	Activation ActivationType
 
 	W *AF32 // Shape (OutputSize, InputSize)
-	B *AF32 // Shape (OutputSize, 1)
+	B *AF32 // Shape (OutputSize)
 
 	InputSize  int
 	OutputSize int
@@ -854,14 +887,14 @@ func MakeDense(activation ActivationType, inputSize, outputSize int, r *rand.Ran
 		InputSize:  inputSize,
 		OutputSize: outputSize,
 		W:          MakeAF32(outputSize, inputSize),
-		B:          MakeAF32(outputSize, 1),
+		B:          MakeAF32(outputSize),
 	}
 
 	for i := 0; i < outputSize; i++ {
 		for j := 0; j < inputSize; j++ {
-			l.W.Set(i, j, float32(r.NormFloat64())*0.1)
+			l.W.Set2(i, j, float32(r.NormFloat64())*0.1)
 		}
-		l.B.Set(i, 0, 0.1)
+		l.B.Set1(i, 0.1)
 	}
 
 	return l
@@ -874,52 +907,49 @@ func MakeDense(activation ActivationType, inputSize, outputSize int, r *rand.Ran
 // dadz (output, optional) is the derivative of the activated output wrt the linear output.  Shape (batchSize, lay.OutputSize)
 // [sliceMin, sliceMax) is the range of samples we should compute over (used for parallelization)
 func (lay *Layer) Apply(x, a, dadz *AF32) {
-	batchSize := x.Shape0
+	batchSize := x.Shape[0]
 	inputSize := lay.InputSize
 	outputSize := lay.OutputSize
 
-	if x.Shape0 != batchSize {
+	if x.Shape[0] != batchSize {
 		panic("dimension mismatch")
 	}
-	if x.Shape1 != inputSize {
+	if x.Shape[1] != inputSize {
 		panic("dimension mismatch")
 	}
-	_ = x.CheckedAt(0, inputSize-1)
-	_ = x.CheckedAt(batchSize-1, inputSize-1)
+	_ = x.At2(0, inputSize-1)
+	_ = x.At2(batchSize-1, inputSize-1)
 
-	if a.Shape0 != batchSize {
+	if a.Shape[0] != batchSize {
 		panic("dimension mismatch")
 	}
-	if a.Shape1 != outputSize {
+	if a.Shape[1] != outputSize {
 		panic("dimension mismatch")
 	}
-	_ = a.CheckedAt(batchSize-1, outputSize-1)
+	_ = a.At2(batchSize-1, outputSize-1)
 
 	if dadz != nil {
-		if dadz.Shape0 != batchSize {
+		if dadz.Shape[0] != batchSize {
 			panic("dimension mismatch")
 		}
-		if dadz.Shape1 != outputSize {
+		if dadz.Shape[1] != outputSize {
 			panic("dimension mismatch")
 		}
-		_ = dadz.CheckedAt(batchSize-1, outputSize-1)
+		_ = dadz.At2(batchSize-1, outputSize-1)
 	}
 
-	if lay.W.Shape0 != outputSize {
+	if lay.W.Shape[0] != outputSize {
 		panic("dimension mismatch")
 	}
-	if lay.W.Shape1 != inputSize {
+	if lay.W.Shape[1] != inputSize {
 		panic("dimension mismatch")
 	}
-	_ = lay.W.CheckedAt(outputSize-1, inputSize-1)
+	_ = lay.W.At2(outputSize-1, inputSize-1)
 
-	if lay.B.Shape0 != outputSize {
-		panic("dimension mismatch")
+	if !slices.Equal(lay.B.Shape, []int{outputSize}) {
+		panic(fmt.Sprintf("lay.B.Shape != {outputSize}"))
 	}
-	if lay.B.Shape1 != 1 {
-		panic("dimension mismatch")
-	}
-	_ = lay.B.CheckedAt(outputSize-1, 0)
+	_ = lay.B.At1(outputSize - 1)
 
 	// Write the linear activations into a.  Equivalent to
 	//
@@ -936,8 +966,8 @@ func (lay *Layer) Apply(x, a, dadz *AF32) {
 	for k := 0; k < batchSize; k++ {
 		for i := 0; i < outputSize; i++ {
 			z := denseDot2SIMD(lay.W.V[i*inputSize:i*inputSize+inputSize], x.V[k*inputSize:k*inputSize+inputSize])
-			z += lay.B.At(i, 0)
-			a.Set(k, i, z)
+			z += lay.B.At1(i)
+			a.Set2(k, i, z)
 		}
 	}
 
@@ -945,18 +975,18 @@ func (lay *Layer) Apply(x, a, dadz *AF32) {
 	// in dadz if provided.
 	for k := 0; k < batchSize; k++ {
 		for i := 0; i < outputSize; i++ {
-			z := a.At(k, i)
+			z := a.At2(k, i)
 			switch lay.Activation {
 			case ReLU:
 				if z <= 0 {
-					a.Set(k, i, 0)
+					a.Set2(k, i, 0)
 				} else {
-					a.Set(k, i, z)
+					a.Set2(k, i, z)
 				}
 			case Linear:
-				a.Set(k, i, z)
+				a.Set2(k, i, z)
 			case Sigmoid:
-				a.Set(k, i, 1/(1+math32.Exp(-z)))
+				a.Set2(k, i, 1/(1+math32.Exp(-z)))
 			default:
 				panic("unhandled activation function")
 			}
@@ -964,16 +994,16 @@ func (lay *Layer) Apply(x, a, dadz *AF32) {
 			if dadz != nil {
 				switch lay.Activation {
 				case Linear:
-					dadz.Set(k, i, 1)
+					dadz.Set2(k, i, 1)
 				case ReLU:
 					if z <= 0 {
-						dadz.Set(k, i, 0)
+						dadz.Set2(k, i, 0)
 					} else {
-						dadz.Set(k, i, 1)
+						dadz.Set2(k, i, 1)
 					}
 				case Sigmoid:
 					tmp := math32.Exp(-z)
-					dadz.Set(k, i, -tmp/(1+tmp)/(1+tmp))
+					dadz.Set2(k, i, -tmp/(1+tmp)/(1+tmp))
 				}
 			}
 		}
@@ -985,7 +1015,7 @@ func (lay *Layer) Apply(x, a, dadz *AF32) {
 // dadzT (input) is the gradient of a_ik wrt z_ik.  Shape (lay.OutputSize, batchSize)
 // dJdw (output) is the gradient of the loss wrt lay.W.  Shape (lay.OutputSize, lay.InputSize)
 func (lay *Layer) BackpropDjdw(xT, djdaT, dadzT, djdw *AF32) {
-	batchSize := xT.Shape1
+	batchSize := xT.Shape[1]
 	inputSize := lay.InputSize
 	outputSize := lay.OutputSize
 
@@ -1008,7 +1038,7 @@ func (lay *Layer) BackpropDjdw(xT, djdaT, dadzT, djdw *AF32) {
 				dadzT.V[i*batchSize:i*batchSize+batchSize],
 				xT.V[j*batchSize:j*batchSize+batchSize],
 			)
-			djdw.Set(i, j, grad)
+			djdw.Set2(i, j, grad)
 		}
 	}
 }
@@ -1017,14 +1047,14 @@ func (lay *Layer) BackpropDjdw(xT, djdaT, dadzT, djdw *AF32) {
 // dadzT (input) is the gradient of a_ik wrt z_ik.  Shape (lay.OutputSize, batchSize)
 // dJdb (output) is the gradient of the loss wrt lay.B.  Shape (lay.OutputSize, 1)
 func (lay *Layer) BackpropDjdb(djdaT, dadzT, dJdb *AF32) {
-	batchSize := djdaT.Shape1
+	batchSize := djdaT.Shape[1]
 	outputSize := lay.OutputSize
 
 	// Compute gradient of loss with respect to biases.
 	iBase := 0
 	for i := 0; i < outputSize; i++ {
 		grad := denseDot2SIMD(djdaT.V[iBase:iBase+batchSize], dadzT.V[iBase:iBase+batchSize])
-		dJdb.Set(i, 0, grad)
+		dJdb.Set1(i, grad)
 
 		iBase += batchSize
 	}
@@ -1035,7 +1065,7 @@ func (lay *Layer) BackpropDjdb(djdaT, dadzT, dJdb *AF32) {
 // wT (input) is the layer weights, tranposed.  Shape (inputSize, outputSize)
 // dJdx (output) is the gradient of the loss wrt x.  Shape (batchSize, lay.InputSize)
 func (lay *Layer) BackpropDjdx(djda, dadz, wT, djdx *AF32) {
-	batchSize := djda.Shape0
+	batchSize := djda.Shape[0]
 	inputSize := lay.InputSize
 	outputSize := lay.OutputSize
 
@@ -1058,7 +1088,7 @@ func (lay *Layer) BackpropDjdx(djda, dadz, wT, djdx *AF32) {
 				dadz.V[k*outputSize:k*outputSize+outputSize],
 				wT.V[j*outputSize:j*outputSize+outputSize],
 			)
-			djdx.Set(k, j, grad)
+			djdx.Set2(k, j, grad)
 		}
 	}
 }

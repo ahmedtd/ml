@@ -76,9 +76,9 @@ func (c *InferCommand) executeErr(ctx context.Context) error {
 	digit := 0
 	score := math32.Inf(-1)
 	for i := 0; i < 10; i++ {
-		if pred.At(0, i) > score {
+		if pred.At2(0, i) > score {
 			digit = i
-			score = pred.At(0, i)
+			score = pred.At2(0, i)
 		}
 	}
 
@@ -105,7 +105,7 @@ func (c *InferCommand) loadImage() (*toolbox.AF32, error) {
 	for y := rawBounds.Min.Y; y < rawBounds.Max.Y; y++ {
 		for x := rawBounds.Min.X; x < rawBounds.Max.X; x++ {
 			v := float32(color.GrayModel.Convert(rawImg.At(x, y)).(color.Gray).Y) / float32(256)
-			out.Set(0, y*28+x, v)
+			out.Set2(0, y*28+x, v)
 		}
 	}
 
