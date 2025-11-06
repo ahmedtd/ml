@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"simd"
 	"slices"
 	"time"
 	"unsafe"
@@ -973,40 +974,24 @@ func (lay *Layer) Apply(x, a, dadz *AF32) {
 
 	// Apply activation function to a elementwise.  Store activation gradients
 	// in dadz if provided.
-	for k := 0; k < batchSize; k++ {
-		for i := 0; i < outputSize; i++ {
-			z := a.At2(k, i)
-			switch lay.Activation {
-			case ReLU:
-				if z <= 0 {
-					a.Set2(k, i, 0)
-				} else {
-					a.Set2(k, i, z)
-				}
-			case Linear:
-				a.Set2(k, i, z)
-			case Sigmoid:
-				a.Set2(k, i, 1/(1+math32.Exp(-z)))
-			default:
-				panic("unhandled activation function")
-			}
-
-			if dadz != nil {
-				switch lay.Activation {
-				case Linear:
-					dadz.Set2(k, i, 1)
-				case ReLU:
-					if z <= 0 {
-						dadz.Set2(k, i, 0)
-					} else {
-						dadz.Set2(k, i, 1)
-					}
-				case Sigmoid:
-					tmp := math32.Exp(-z)
-					dadz.Set2(k, i, -tmp/(1+tmp)/(1+tmp))
-				}
-			}
+	switch lay.Activation {
+	case ReLU:
+		if dadz != nil {
+			reluActivationGradient(a.V, dadz.V)
 		}
+		reluActivation(a.V)
+	case Linear:
+		if dadz != nil {
+			linearActivationGradient(dadz.V)
+		}
+		// linear activation is a no-op
+	case Sigmoid:
+		if dadz != nil {
+			sigmoidActivationGradient(a.V, dadz.V)
+		}
+		sigmoidActivation(a.V)
+	default:
+		panic("unhandled activation function")
 	}
 }
 
@@ -1090,5 +1075,74 @@ func (lay *Layer) BackpropDjdx(djda, dadz, wT, djdx *AF32) {
 			)
 			djdx.Set2(k, j, grad)
 		}
+	}
+}
+
+// z (input/output)
+func reluActivation(z []float32) {
+	var z0, z1, z2, z3, zeros simd.Float32x8
+	for len(z) >= 32 {
+		z3 = simd.LoadFloat32x8Slice(z[24:])
+		z2 = simd.LoadFloat32x8Slice(z[16:])
+		z1 = simd.LoadFloat32x8Slice(z[8:])
+		z0 = simd.LoadFloat32x8Slice(z[:])
+
+		z3.Max(zeros).StoreSlice(z[24:])
+		z2.Max(zeros).StoreSlice(z[16:])
+		z1.Max(zeros).StoreSlice(z[8:])
+		z0.Max(zeros).StoreSlice(z[:])
+
+		z = z[32:]
+	}
+
+	// Handle tail of less than 32 but more than 8 elements.
+	for len(z) >= 8 {
+		z0 = simd.LoadFloat32x8Slice(z)
+		z0.Max(zeros).StoreSlice(z)
+		z = z[8:]
+	}
+
+	// Handle final tail of less than 8 elements
+	if len(z) > 0 {
+		z0 = simd.LoadFloat32x8SlicePart(z)
+		z0.Max(zeros).StoreSlicePart(z)
+	}
+}
+
+// reluActivationGradient computes the derivative of the ReLU function.
+//
+// z (input) is the pre-activation linear output of a layer.
+//
+// dadz (output) is the derivative of ReLU(z)
+func reluActivationGradient(z, dadz []float32) {
+	if len(z) != len(dadz) {
+		panic("len(z) != len(dadz)")
+	}
+
+	for i := 0; i < len(z); i++ {
+		if z[i] <= 0 {
+			dadz[i] = 0
+		} else {
+			dadz[i] = 1
+		}
+	}
+}
+
+func linearActivationGradient(dadz []float32) {
+	for i := 0; i < len(dadz); i++ {
+		dadz[i] = 1
+	}
+}
+
+func sigmoidActivation(z []float32) {
+	for i := 0; i < len(z); i++ {
+		z[i] = 1 / (1 + math32.Exp(-z[i]))
+	}
+}
+
+func sigmoidActivationGradient(z, dadz []float32) {
+	for i := 0; i < len(z); i++ {
+		tmp := math32.Exp(-z[i])
+		dadz[i] = -tmp / (1 + tmp) / (1 + tmp)
 	}
 }
