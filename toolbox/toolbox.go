@@ -133,6 +133,13 @@ func (a *AF32) Set2(idx0, idx1 int, v float32) {
 	a.V[idx0*a.Shape[1]+idx1] = v
 }
 
+func (a *AF32) Set3(idx0, idx1, idx2 int, v float32) {
+	if len(a.Shape) != 3 {
+		panic("Set3 only valid for rank-3 AF32")
+	}
+	a.V[idx0*a.Shape[1]*a.Shape[2]+idx1*a.Shape[2]+idx2] = v
+}
+
 func WriteSafeTensors(w io.Writer, tensors map[string]*AF32) error {
 	header := map[string]SafeTensorInfo{}
 	dataOffset := 0
@@ -1144,5 +1151,36 @@ func sigmoidActivationGradient(z, dadz []float32) {
 	for i := 0; i < len(z); i++ {
 		tmp := math32.Exp(-z[i])
 		dadz[i] = -tmp / (1 + tmp) / (1 + tmp)
+	}
+}
+
+// im2col unrolls the memory accesses that need to be performed by a convolution
+// over an image, so that the inner loop of the convolution kernel application
+// is a sequential access pattern with no cache misses.
+//
+// For example, turns a {25,25} tensor into
+func im2col(kernelSize, stride int, in, out *AF32) {
+	if len(in.Shape) != 2 {
+		panic("len(in.Shape) != 2")
+	}
+	wantOutShape := []int{in.Shape[0] / stride, in.Shape[1] / stride, kernelSize * kernelSize}
+	if !slices.Equal(out.Shape, wantOutShape) {
+		panic(fmt.Sprintf("out.Shape != %v", wantOutShape))
+	}
+
+	for i := 0; i < in.Shape[0]; i += stride {
+		for j := 0; j < in.Shape[1]; j += stride {
+			for k := 0; k < kernelSize; k++ {
+				for l := 0; l < kernelSize; l++ {
+					r := i - kernelSize/2 + k
+					c := j - kernelSize/2 + l
+					if r < 0 || c < 0 || r >= in.Shape[0] || r >= in.Shape[1] {
+						out.Set3(i, j, k*kernelSize+l, 0)
+					} else {
+						out.Set3(i, j, k*kernelSize+l, in.At2(i-kernelSize/2+k, j-kernelSize/2+l))
+					}
+				}
+			}
+		}
 	}
 }
