@@ -2,7 +2,9 @@
 
 package toolbox
 
-import "simd"
+import (
+	"simd/archsimd"
+)
 
 func denseDot2Naive(x []float32, y []float32) float32 {
 	if len(x) != len(y) {
@@ -27,22 +29,22 @@ func denseDot2SIMD(x []float32, y []float32) float32 {
 	// return sum
 
 	var (
-		s0, s1, s2, s3 simd.Float32x8
+		s0, s1, s2, s3 archsimd.Float32x8
 	)
 
 	// Writing anything slice indexing related in constant can reduce the bound checks.
 	// Our bound-check elimination pass is clever at reasoning constants, but struggles
 	// at reasoning expressions with variables.
 	for len(x) >= 32 && len(y) >= 32 {
-		x3 := simd.LoadFloat32x8Slice(x[24:])
-		x2 := simd.LoadFloat32x8Slice(x[16:])
-		x1 := simd.LoadFloat32x8Slice(x[8:])
-		x0 := simd.LoadFloat32x8Slice(x[:])
+		x3 := archsimd.LoadFloat32x8Slice(x[24:])
+		x2 := archsimd.LoadFloat32x8Slice(x[16:])
+		x1 := archsimd.LoadFloat32x8Slice(x[8:])
+		x0 := archsimd.LoadFloat32x8Slice(x[:])
 		x = x[32:]
-		y3 := simd.LoadFloat32x8Slice(y[24:])
-		y2 := simd.LoadFloat32x8Slice(y[16:])
-		y1 := simd.LoadFloat32x8Slice(y[8:])
-		y0 := simd.LoadFloat32x8Slice(y[:])
+		y3 := archsimd.LoadFloat32x8Slice(y[24:])
+		y2 := archsimd.LoadFloat32x8Slice(y[16:])
+		y1 := archsimd.LoadFloat32x8Slice(y[8:])
+		y0 := archsimd.LoadFloat32x8Slice(y[:])
 		y = y[32:]
 
 		s0 = x0.MulAdd(y0, s0)
