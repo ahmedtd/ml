@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
-	"simd/archsimd"
 	"slices"
 	"time"
 	"unsafe"
@@ -1082,37 +1081,6 @@ func (lay *Layer) BackpropDjdx(djda, dadz, wT, djdx *AF32) {
 			)
 			djdx.Set2(k, j, grad)
 		}
-	}
-}
-
-// z (input/output)
-func reluActivation(z []float32) {
-	var z0, z1, z2, z3, zeros archsimd.Float32x8
-	for len(z) >= 32 {
-		z3 = archsimd.LoadFloat32x8Slice(z[24:])
-		z2 = archsimd.LoadFloat32x8Slice(z[16:])
-		z1 = archsimd.LoadFloat32x8Slice(z[8:])
-		z0 = archsimd.LoadFloat32x8Slice(z[:])
-
-		z3.Max(zeros).StoreSlice(z[24:])
-		z2.Max(zeros).StoreSlice(z[16:])
-		z1.Max(zeros).StoreSlice(z[8:])
-		z0.Max(zeros).StoreSlice(z[:])
-
-		z = z[32:]
-	}
-
-	// Handle tail of less than 32 but more than 8 elements.
-	for len(z) >= 8 {
-		z0 = archsimd.LoadFloat32x8Slice(z)
-		z0.Max(zeros).StoreSlice(z)
-		z = z[8:]
-	}
-
-	// Handle final tail of less than 8 elements
-	if len(z) > 0 {
-		z0 = archsimd.LoadFloat32x8SlicePart(z)
-		z0.Max(zeros).StoreSlicePart(z)
 	}
 }
 

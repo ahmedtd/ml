@@ -74,3 +74,64 @@ func denseDot2SIMD(x []float32, y []float32) float32 {
 
 	return sum
 }
+
+func denseDot3Naive(x, y, z []float32) float32 {
+	if len(x) != len(y) || len(x) != len(z) {
+		panic("all input slices must have the same length")
+	}
+	var sum float32
+	for i := range len(x) {
+		sum += x[i] * y[i] * z[i]
+	}
+	return sum
+}
+
+func denseDot3SIMD(x, y, z []float32) float32 {
+	var a archsimd.Float32x8
+	i := 0
+	for ; i < len(x)-8; i += 8 { // this idiom is friendly to bounds check elimination
+		xv := archsimd.LoadFloat32x8Slice(x[i : i+8])
+		yv := archsimd.LoadFloat32x8Slice(y[i : i+8])
+		zv := archsimd.LoadFloat32x8Slice(z[i : i+8])
+		a = xv.Mul(yv).MulAdd(zv, a)
+	}
+	xv := archsimd.LoadFloat32x8SlicePart(x[i:])
+	yv := archsimd.LoadFloat32x8SlicePart(y[i:])
+	zv := archsimd.LoadFloat32x8SlicePart(z[i:])
+	a = xv.Mul(yv).MulAdd(zv, a)
+	a = a.AddPairsGrouped(a) // 01234567                AP 01234567                -> 0+1 2+3 _ _ 4+5 6+7 _ _
+	a = a.AddPairsGrouped(a) // 0+1 2+3 _ _ 4+5 6+7 _ _ AP 0+1 2+3 _ _ 4+5 6+7 _ _ -> 0+1+2+3 _ _ _ 4+5+6+7 _ _ _
+	b := a.GetLo().Add(a.GetHi())
+	return b.GetElem(0)
+}
+
+// z (input/output)
+func reluActivation(z []float32) {
+	var z0, z1, z2, z3, zeros archsimd.Float32x8
+	for len(z) >= 32 {
+		z3 = archsimd.LoadFloat32x8Slice(z[24:])
+		z2 = archsimd.LoadFloat32x8Slice(z[16:])
+		z1 = archsimd.LoadFloat32x8Slice(z[8:])
+		z0 = archsimd.LoadFloat32x8Slice(z[:])
+
+		z3.Max(zeros).StoreSlice(z[24:])
+		z2.Max(zeros).StoreSlice(z[16:])
+		z1.Max(zeros).StoreSlice(z[8:])
+		z0.Max(zeros).StoreSlice(z[:])
+
+		z = z[32:]
+	}
+
+	// Handle tail of less than 32 but more than 8 elements.
+	for len(z) >= 8 {
+		z0 = archsimd.LoadFloat32x8Slice(z)
+		z0.Max(zeros).StoreSlice(z)
+		z = z[8:]
+	}
+
+	// Handle final tail of less than 8 elements
+	if len(z) > 0 {
+		z0 = archsimd.LoadFloat32x8SlicePart(z)
+		z0.Max(zeros).StoreSlicePart(z)
+	}
+}
